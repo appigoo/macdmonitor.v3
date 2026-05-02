@@ -590,7 +590,18 @@ def send_telegram(token, chat_id, text):
 
 
 # ══════════════════════════════════════════════════════════════
-# 回測引擎
+# 回測引擎  ── 忠實還原三步入場邏輯
+# ══════════════════════════════════════════════════════════════
+#
+#  入場三步驟：
+#  Step 1  1d + 1h Histogram > 0          ← 大方向多頭確認
+#  Step 2  傳導鏈預警：
+#           1m D+1 > 0 → 5m D+1 > 0 → 15m D+1 > 0 → 30m D+1 > 0
+#           （小時框 D+1 依序預測翻正 → 預警發出）
+#  Step 3  30m Histogram 實際翻正          ← 執行入場
+#
+#  回測資料：最近 60 天日內 1m/5m/15m/30m/1h + 日線 1d
+#  出場：持倉 N 根 30m K 線 或 ATR 止損/止盈
 # ══════════════════════════════════════════════════════════════
 
 BACKTEST_PERIODS = {
@@ -600,396 +611,432 @@ BACKTEST_PERIODS = {
     "10年": "10y",
 }
 
+# 回測固定用 60 天日內數據
+BT_INTRADAY_CONFIGS = {
+    "1m":  {"period": "7d",  "interval": "1m"},
+    "5m":  {"period": "60d", "interval": "5m"},
+    "15m": {"period": "60d", "interval": "15m"},
+    "30m": {"period": "60d", "interval": "30m"},
+    "1h":  {"period": "60d", "interval": "1h"},
+    "1d":  {"period": "180d","interval": "1d"},
+}
+
+
 @st.cache_data(ttl=300)
-def fetch_backtest_layers(symbol: str) -> dict:
-    """
-    取回所有回測時框數據。
-    瀑布傳導鏈：1w / 1d / 4h（合成）/ 1h
-    1h 最多 730 天，用於 1y/2y 回測。
-    5y/10y 自動使用日線觸發。
-    """
-    result = {}
+def fetch_bt_tf(symbol: str, period: str, interval: str) -> pd.DataFrame:
     try:
-        result["1w"] = yf.Ticker(symbol).history(period="10y",  interval="1wk").dropna()
-    except: result["1w"] = pd.DataFrame()
-    try:
-        result["1d"] = yf.Ticker(symbol).history(period="10y",  interval="1d").dropna()
-    except: result["1d"] = pd.DataFrame()
-    try:
-        df_1h = yf.Ticker(symbol).history(period="730d", interval="1h").dropna()
-        result["1h"] = df_1h
-        if not df_1h.empty:
-            df_1h_c = df_1h.copy()
-            df_1h_c.index = pd.to_datetime(df_1h_c.index, utc=True)
-            r = df_1h_c.resample("4h")
-            result["4h"] = pd.DataFrame({
-                "Open":   r["Open"].first(),
-                "High":   r["High"].max(),
-                "Low":    r["Low"].min(),
-                "Close":  r["Close"].last(),
-                "Volume": r["Volume"].sum(),
-            }).dropna()
-        else:
-            result["4h"] = pd.DataFrame()
+        df = yf.Ticker(symbol).history(period=period, interval=interval)
+        if df.empty:
+            return pd.DataFrame()
+        df = df[["Open","High","Low","Close","Volume"]].dropna()
+        # 統一轉為 America/New_York 時區，移除 tz 方便對齊
+        if df.index.tz is not None:
+            df.index = df.index.tz_convert("America/New_York").tz_localize(None)
+        return df
     except:
-        result["1h"] = pd.DataFrame()
-        result["4h"] = pd.DataFrame()
-    return result
+        return pd.DataFrame()
 
 
-def _calc_atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    h, l, cp = df["High"], df["Low"], df["Close"].shift(1)
-    tr = pd.concat([h - l, (h - cp).abs(), (l - cp).abs()], axis=1).max(axis=1)
-    return tr.ewm(span=period, adjust=False).mean()
-
-
-def _d1_series(hist: pd.Series) -> pd.Series:
-    """D+1 預測序列：slope = (hist[i] - hist[i-2]) / 2，d1 = hist[i] + slope"""
-    slope = (hist - hist.shift(2)) / 2.0
-    return hist + slope
-
-
-def _align_confirm(hist_slow: pd.Series, trig_idx: pd.DatetimeIndex) -> pd.Series:
-    """把慢速時框 Histogram 向前填充對齊到觸發時框索引"""
-    s = hist_slow.copy()
-    s.index = pd.to_datetime(s.index, utc=True)
-    return s.reindex(s.index.union(trig_idx)).ffill().reindex(trig_idx)
-
-
-def run_backtest(
-    layers: dict,
-    period_label: str,
-    hold_bars: int = 10,
-    atr_sl: float = 1.5,
-    atr_tp: float = 3.0,
-) -> dict:
+def get_d1_series(df: pd.DataFrame) -> pd.Series:
     """
-    ══════════════════════════════════════════════════════
-    瀑布傳導回測引擎  — 三步入場邏輯
-
-    第一步：1w + 1d 確認大方向多頭
-      1w Histogram > 0 OR 1w D+1 > 0
-      1d Histogram > 0 OR 1d D+1 > 0
-
-    第二步：4h 中間傳導層
-      4h Histogram > 0 OR 4h D+1 > 0
-
-    第三步：1h 觸發（1y/2y）/ 1d 觸發（5y/10y）
-      觸發層 Histogram < 0（尚未入場）
-      觸發層 D+1 > 0（預計翻正）← 核心信號
-      觸發層連續2根縮減（傳導中）
-    ══════════════════════════════════════════════════════
+    為 df 每一根 K 線計算當時的 D+1 預測值。
+    使用 rolling 方式，每個時間點只用歷史數據（無未來偷看）。
     """
-    long_period = period_label in ["5年","10年"]
-    trig_label  = "1d" if long_period else "1h"
+    _, _, hist = calc_macd(df["Close"])
+    d1_vals = pd.Series(index=df.index, dtype=float)
+    for i in range(3, len(hist)):
+        v     = hist.iloc[i-2:i+1].values          # 最近3根
+        slope = (v[-1] - v[0]) / 2
+        d1_vals.iloc[i] = v[-1] + slope
+    return d1_vals, hist
 
-    df_trig  = layers.get(trig_label, pd.DataFrame())
-    df_1w    = layers.get("1w",  pd.DataFrame())
-    df_1d    = layers.get("1d",  pd.DataFrame())
-    df_4h    = layers.get("4h",  pd.DataFrame())
 
-    if df_trig.empty or len(df_trig) < 60:
-        return {"error": f"觸發時框 {trig_label} 數據不足", "total": 0}
+def align_to_30m(df_30m: pd.DataFrame,
+                 df_5m:  pd.DataFrame,
+                 df_15m: pd.DataFrame,
+                 df_1h:  pd.DataFrame,
+                 df_1d:  pd.DataFrame) -> pd.DataFrame:
+    """
+    以 30m K 線為基準時間軸，對齊各時框最新狀態。
+    每根 30m K 線結束時，查詢當時各時框的最新值。
+    """
+    # 計算各時框的 D+1 預測序列 和 Histogram 序列
+    d1_5m,  hist_5m  = get_d1_series(df_5m)
+    d1_15m, hist_15m = get_d1_series(df_15m)
+    d1_30m, hist_30m = get_d1_series(df_30m)
+    d1_1h,  hist_1h  = get_d1_series(df_1h)
+    _,      hist_1d  = calc_macd(df_1d["Close"])
+    _,      hist_1d  = calc_macd(df_1d["Close"])
+    _, sig_1d, hist_1d = calc_macd(df_1d["Close"])
 
-    # 截取回測時間範圍
-    period_days = {"1年":365,"2年":730,"5年":1825,"10年":3650}
-    cutoff_days = period_days.get(period_label, 730)
-    df_trig.index = pd.to_datetime(df_trig.index, utc=True)
-    cutoff_dt = df_trig.index[-1] - pd.Timedelta(days=cutoff_days)
-    df_trig   = df_trig[df_trig.index >= cutoff_dt]
-    if len(df_trig) < 60:
-        return {"error": "截取後數據不足60根", "total": 0}
+    rows = []
+    for i in range(10, len(df_30m)):
+        t30 = df_30m.index[i]   # 當前 30m K 線結束時間
 
-    # 觸發層指標
-    _, _, hist_trig = calc_macd(df_trig["Close"])
-    atr_trig        = _calc_atr_series(df_trig)
-    d1_trig         = _d1_series(hist_trig)
-    trig_idx        = pd.to_datetime(hist_trig.index, utc=True)
+        def latest_before(series: pd.Series, t) -> float:
+            """取 t 時間點之前（含）最新的有效值"""
+            sub = series[series.index <= t].dropna()
+            return sub.iloc[-1] if len(sub) > 0 else np.nan
 
-    # 確認層（對齊到觸發層索引）
-    def conf_arrays(df_conf):
-        if df_conf is None or df_conf.empty or len(df_conf) < 26:
-            return None, None
-        _, _, hc = calc_macd(df_conf["Close"])
-        d1c = _d1_series(hc)
-        return (_align_confirm(hc, trig_idx).values,
-                _align_confirm(d1c, trig_idx).values)
+        # 30m 本身
+        h30   = hist_30m.iloc[i]
+        d1_30 = d1_30m.iloc[i]
 
-    c1w_h,  c1w_d1  = conf_arrays(df_1w)            # 週線
-    c1d_h,  c1d_d1  = conf_arrays(df_1d if long_period else df_1d)
-    c4h_h,  c4h_d1  = conf_arrays(df_4h if not long_period else None)
+        # 5m：t30 之前最新值
+        h5    = latest_before(hist_5m,  t30)
+        d5    = latest_before(d1_5m,    t30)
 
-    # 主回測
-    h_arr   = hist_trig.values.astype(float)
-    d1_arr  = d1_trig.values.astype(float)
-    atr_arr = atr_trig.values.astype(float)
-    lo_arr  = df_trig["Low"].values.astype(float)
-    hi_arr  = df_trig["High"].values.astype(float)
-    c_arr   = df_trig["Close"].values.astype(float)
-    dates   = trig_idx
+        # 15m
+        h15   = latest_before(hist_15m, t30)
+        d15   = latest_before(d1_15m,   t30)
 
-    def layer_ok(h_a, d1_a, i):
-        if h_a is None or np.isnan(h_a[i]): return True
-        return float(h_a[i]) > 0 or float(d1_a[i]) > 0
+        # 1h
+        h1h   = latest_before(hist_1h,  t30)
+        d1h   = latest_before(d1_1h,    t30)
 
-    trades, in_trade = [], False
-    entry_i = entry_price = entry_atr_v = None
+        # 1d：取 t30 日期當天或之前最新日線
+        t30_date = t30.date() if hasattr(t30, 'date') else pd.Timestamp(t30).date()
+        sub_1d   = hist_1d[pd.to_datetime(hist_1d.index).date <= t30_date]
+        h1d      = sub_1d.iloc[-1] if len(sub_1d) > 0 else np.nan
 
-    for i in range(30, len(h_arr) - hold_bars - 1):
-        if np.isnan(atr_arr[i]) or atr_arr[i] <= 0:
+        rows.append({
+            "time":  t30,
+            "close": df_30m["Close"].iloc[i],
+            # 30m
+            "h30":   h30,
+            "d1_30": d1_30,
+            # 5m
+            "h5":    h5,
+            "d1_5":  d5,
+            # 15m
+            "h15":   h15,
+            "d1_15": d15,
+            # 1h 確認
+            "h1h":   h1h,
+            "d1_1h": d1h,
+            # 1d 確認
+            "h1d":   h1d,
+        })
+
+    return pd.DataFrame(rows).set_index("time")
+
+
+def run_cascade_backtest(symbol: str, atr_sl: float = 1.5,
+                          atr_tp: float = 3.0, hold_bars: int = 6) -> dict:
+    """
+    三步瀑布傳導回測（最近 60 天 30m K 線）
+
+    Step1: h1d > 0 AND h1h > 0                   ← 大方向多頭
+    Step2: d1_5 > 0 AND d1_15 > 0 AND d1_30 > 0  ← 傳導鏈 D+1 預測翻正
+           (5m → 15m → 30m 預測鏈對齊)
+    Step3: h30 前一根 < 0，當根 >= 0              ← 30m 實際翻正，入場
+
+    出場：
+      - 持倉 hold_bars 根 30m K 線後平倉
+      - 或跌破 sl = 入場價 - atr_sl × ATR(30m)
+      - 或漲過 tp = 入場價 + atr_tp × ATR(30m)
+    """
+    # 載入所有時框
+    dfs = {}
+    for tf, cfg in BT_INTRADAY_CONFIGS.items():
+        df = fetch_bt_tf(symbol, cfg["period"], cfg["interval"])
+        if df.empty:
+            return {"error": f"{tf} 數據載入失敗"}
+        dfs[tf] = df
+
+    # 對齊到 30m 軸
+    try:
+        aligned = align_to_30m(
+            dfs["30m"], dfs["5m"], dfs["15m"], dfs["1h"], dfs["1d"]
+        )
+    except Exception as e:
+        return {"error": f"時框對齊失敗: {e}"}
+
+    if len(aligned) < 20:
+        return {"error": "有效數據不足20根30m K線"}
+
+    # 計算 ATR(30m)
+    _, _, hist_30m_full = calc_macd(dfs["30m"]["Close"])
+    atr_30m = calc_atr(dfs["30m"])
+
+    # 主回測循環
+    trades   = []
+    in_trade = False
+    entry_price = entry_bar = None
+
+    close_arr = aligned["close"].values
+    h30_arr   = aligned["h30"].values
+    d1_30_arr = aligned["d1_30"].values
+    d1_5_arr  = aligned["d1_5"].values
+    d1_15_arr = aligned["d1_15"].values
+    h1h_arr   = aligned["h1h"].values
+    h1d_arr   = aligned["h1d"].values
+    times     = aligned.index
+
+    for i in range(5, len(aligned)):
+        if np.isnan(h30_arr[i]) or np.isnan(close_arr[i]):
             continue
 
         if not in_trade:
-            # ── 三步入場條件 ────────────────────────────
-            step1 = layer_ok(c1w_h, c1w_d1, i)     # 週線多頭
-            step2 = layer_ok(c1d_h, c1d_d1, i)     # 日線多頭
-            step3 = layer_ok(c4h_h, c4h_d1, i) if not long_period else True  # 4h傳導
-
-            h_now   = float(h_arr[i])
-            d1_now  = float(d1_arr[i])
-            h_prev  = float(h_arr[i-1]) if i>0 else h_now
-            h_prev2 = float(h_arr[i-2]) if i>1 else h_prev
-
-            shrinking = (abs(h_now) < abs(h_prev)) and (abs(h_prev) < abs(h_prev2))
-
-            trigger = (
-                h_now  < 0    and  # 觸發層仍為負（尚未入場）
-                d1_now > 0    and  # D+1 預測翻正 ← 核心
-                shrinking     and  # 動能連續縮減（傳導進行中）
-                h_prev < 0    and  # 前根也在空頭
-                step1 and step2 and step3
+            # ── Step 1：大方向確認 ─────────────────────────
+            step1 = (
+                not np.isnan(h1d_arr[i]) and h1d_arr[i] > 0 and   # 1d 多頭
+                not np.isnan(h1h_arr[i]) and h1h_arr[i] > 0        # 1h 多頭
             )
+            if not step1:
+                continue
 
-            if trigger:
-                ei = i + 1
-                if ei >= len(c_arr): continue
+            # ── Step 2：傳導鏈 D+1 預測翻正 ───────────────
+            step2 = (
+                not np.isnan(d1_5_arr[i])  and d1_5_arr[i]  > 0 and  # 5m D+1 轉正
+                not np.isnan(d1_15_arr[i]) and d1_15_arr[i] > 0 and  # 15m D+1 轉正
+                not np.isnan(d1_30_arr[i]) and d1_30_arr[i] > 0 and  # 30m D+1 轉正
+                h30_arr[i] < 0                                         # 30m 當前仍負
+            )
+            if not step2:
+                continue
+
+            # ── Step 3：30m 實際翻正 → 入場 ───────────────
+            h30_prev = h30_arr[i-1] if i > 0 else h30_arr[i]
+            step3 = (h30_prev < 0 and h30_arr[i] >= 0)
+
+            if step3:
                 in_trade    = True
-                entry_i     = ei
-                entry_price = float(c_arr[ei])
-                entry_atr_v = float(atr_arr[i])
+                entry_bar   = i
+                entry_price = close_arr[i]
 
-        elif in_trade and entry_i is not None:
-            bars_held = i - entry_i
-            sl = entry_price - atr_sl * entry_atr_v
-            tp = entry_price + atr_tp * entry_atr_v
+        else:
+            # ── 出場檢測 ──────────────────────────────────
+            bars_held = i - entry_bar
+            cur       = close_arr[i]
+            sl        = entry_price - atr_sl * atr_30m
+            tp        = entry_price + atr_tp * atr_30m
 
-            exit_reason = None
-            exit_price  = float(c_arr[i])
-
-            if lo_arr[i] <= sl:
-                exit_reason, exit_price = "止損", sl
-            elif hi_arr[i] >= tp:
-                exit_reason, exit_price = "止盈", tp
+            reason = exit_price = None
+            if cur <= sl:
+                reason, exit_price = "止損", max(sl, cur)
+            elif cur >= tp:
+                reason, exit_price = "止盈", min(tp, cur)
             elif bars_held >= hold_bars:
-                exit_reason = "到期平倉"
+                reason, exit_price = "到期平倉", cur
 
-            if exit_reason:
+            if reason:
                 pnl = (exit_price - entry_price) / entry_price * 100
                 trades.append({
-                    "entry_date":  dates[entry_i],
-                    "exit_date":   dates[i],
+                    "entry_time":  times[entry_bar],
+                    "exit_time":   times[i],
                     "entry_price": entry_price,
                     "exit_price":  exit_price,
-                    "pnl_pct":     pnl,
                     "bars_held":   bars_held,
-                    "exit_reason": exit_reason,
+                    "pnl_pct":     pnl,
                     "win":         pnl > 0,
-                    "year":        int(dates[entry_i].year),
-                    "trigger_tf":  trig_label,
+                    "exit_reason": reason,
+                    "date":        pd.Timestamp(times[entry_bar]).date(),
                 })
-                in_trade = False
-                entry_i = entry_price = entry_atr_v = None
+                in_trade = in_trade = False
+                entry_price = entry_bar = None
 
     if not trades:
-        return {"trades":[], "total":0, "wins":0, "losses":0,
-                "win_rate":0, "avg_win":0, "avg_loss":0,
-                "profit_factor":0, "max_consec_loss":0,
-                "total_return":0, "by_year":{}, "trigger_tf":trig_label}
+        return {
+            "trades": [], "total": 0, "wins": 0, "losses": 0,
+            "win_rate": 0, "avg_win": 0, "avg_loss": 0,
+            "profit_factor": 0, "max_consec_loss": 0,
+            "total_return": 0, "aligned": aligned,
+        }
 
     df_t   = pd.DataFrame(trades)
     wins   = df_t[df_t["win"]]
     losses = df_t[~df_t["win"]]
 
-    max_cl = cur_cl = 0
+    # 最大連虧
+    mc = cur_mc = 0
     for w in df_t["win"]:
-        cur_cl = 0 if w else cur_cl + 1
-        max_cl = max(max_cl, cur_cl)
+        cur_mc = 0 if w else cur_mc + 1
+        mc     = max(mc, cur_mc)
 
-    by_year = {}
-    for yr, grp in df_t.groupby("year"):
-        w = grp[grp["win"]]
-        by_year[int(yr)] = {
-            "total":    len(grp),
-            "wins":     len(w),
-            "win_rate": len(w)/len(grp)*100,
-            "avg_pnl":  grp["pnl_pct"].mean(),
-        }
-
-    aw = wins["pnl_pct"].mean()   if len(wins)   > 0 else 0.0
-    al = losses["pnl_pct"].mean() if len(losses) > 0 else 0.0
-    pf = abs(aw*len(wins)) / abs(al*len(losses)) if len(losses)>0 and al!=0 else 99.0
+    aw = wins["pnl_pct"].mean()   if len(wins)   > 0 else 0
+    al = losses["pnl_pct"].mean() if len(losses) > 0 else 0
+    pf = abs(aw * len(wins)) / abs(al * len(losses)) if len(losses) > 0 and al != 0 else 99
 
     return {
-        "trades": df_t.to_dict("records"), "total": len(df_t),
-        "wins": len(wins), "losses": len(losses),
-        "win_rate":        len(wins)/len(df_t)*100,
-        "avg_win":         aw,  "avg_loss": al,
-        "profit_factor":   min(pf,99.0),
-        "max_consec_loss": max_cl,
-        "total_return":    df_t["pnl_pct"].sum(),
-        "by_year":         by_year,
+        "trades":          trades,
         "df_trades":       df_t,
-        "trigger_tf":      trig_label,
+        "total":           len(df_t),
+        "wins":            len(wins),
+        "losses":          len(losses),
+        "win_rate":        len(wins) / len(df_t) * 100,
+        "avg_win":         aw,
+        "avg_loss":        al,
+        "profit_factor":   min(pf, 99),
+        "max_consec_loss": mc,
+        "total_return":    df_t["pnl_pct"].sum(),
+        "aligned":         aligned,
     }
 
 
-def build_equity_curve(trades: list) -> go.Figure:
-    """權益曲線圖"""
-    if not trades:
-        return go.Figure()
+# ── 回測圖表 ──────────────────────────────────────────────────
 
-    df_t    = pd.DataFrame(trades)
-    cum_pnl = df_t["pnl_pct"].cumsum().values
-    dates   = pd.to_datetime(df_t["exit_date"])
-    colors  = ["#3d8b5e" if p > 0 else "#c0392b" for p in df_t["pnl_pct"]]
+def build_bt_entry_chart(aligned: pd.DataFrame, trades: list) -> go.Figure:
+    """
+    在 30m Histogram 圖上標注入場/出場點
+    """
+    _, _, hist_vals = calc_macd(pd.Series(aligned["close"].values,
+                                           index=aligned.index))
+    xl     = [str(t) for t in aligned.index]
+    colors = ["#3d8b5e" if v >= 0 else "#c0392b" for v in aligned["h30"]]
 
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=False,
-                        row_heights=[0.65, 0.35], vertical_spacing=0.08,
-                        subplot_titles=["累計收益曲線（%）", "每筆交易盈虧（%）"])
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.5, 0.5], vertical_spacing=0.06,
+                        subplot_titles=["30m 收盤價  ▲入場  ▼出場", "30m Histogram + D+1 預測"])
 
-    # 累計曲線
+    # 收盤線
     fig.add_trace(go.Scatter(
-        x=dates, y=cum_pnl, mode="lines+markers",
-        name="累計收益",
-        line=dict(color="#5a7fa8", width=2),
-        marker=dict(size=4, color=colors),
-        fill="tozeroy",
-        fillcolor="rgba(90,127,168,0.08)",
+        x=xl, y=aligned["close"].values, mode="lines",
+        name="收盤", line=dict(color="#5a7fa8", width=1.5),
     ), row=1, col=1)
-    fig.add_hline(y=0, line_dash="dot", line_color="#aaa", row=1, col=1)
 
-    # 逐筆柱
+    # 入場/出場標記
+    if trades:
+        entry_x = [str(t["entry_time"]) for t in trades]
+        entry_y = [t["entry_price"]     for t in trades]
+        exit_x  = [str(t["exit_time"])  for t in trades]
+        exit_y  = [t["exit_price"]      for t in trades]
+        win_clr = ["#3d8b5e" if t["win"] else "#c0392b" for t in trades]
+
+        fig.add_trace(go.Scatter(
+            x=entry_x, y=entry_y, mode="markers",
+            name="入場", marker=dict(symbol="triangle-up", size=12,
+                                     color=win_clr, line=dict(width=1, color="#fff")),
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=exit_x, y=exit_y, mode="markers",
+            name="出場", marker=dict(symbol="triangle-down", size=12,
+                                     color=win_clr, line=dict(width=1, color="#fff")),
+        ), row=1, col=1)
+
+    # Histogram 柱
     fig.add_trace(go.Bar(
-        x=dates, y=df_t["pnl_pct"],
-        name="單筆盈虧",
-        marker_color=colors,
-        opacity=0.8,
+        x=xl, y=aligned["h30"].values, name="30m Hist",
+        marker_color=colors, opacity=0.8,
     ), row=2, col=1)
-    fig.add_hline(y=0, line_dash="dot", line_color="#aaa", row=2, col=1)
+
+    # D+1 預測線
+    fig.add_trace(go.Scatter(
+        x=xl, y=aligned["d1_30"].values, mode="lines",
+        name="D+1 預測", line=dict(color="#e07b39", width=1.5, dash="dot"),
+    ), row=2, col=1)
+    fig.add_hline(y=0, line_dash="dot", line_color="#bbb", row=2, col=1)
+
+    # x 軸抽稀
+    step = max(1, len(xl)//14)
+    tv   = xl[::step]
 
     fig.update_layout(
         paper_bgcolor="#fff8f0", plot_bgcolor="#fff8f0",
-        font=dict(family="IBM Plex Mono, Noto Sans TC", color="#2c2c2c", size=11),
+        font=dict(family="IBM Plex Mono", color="#2c2c2c", size=10),
         margin=dict(l=10, r=10, t=36, b=10),
-        height=420,
-        showlegend=False,
+        height=500,
+        legend=dict(orientation="h", y=1.02, x=0),
+        xaxis=dict(type="category", tickvals=tv, tickangle=-35, gridcolor="#e8e3da"),
+        xaxis2=dict(type="category", tickvals=tv, tickangle=-35, gridcolor="#e8e3da"),
     )
-    fig.update_xaxes(gridcolor="#e8e3da")
     fig.update_yaxes(gridcolor="#e8e3da", zeroline=True, zerolinecolor="#c0bbb2")
     return fig
 
 
-def build_yearly_chart(by_year: dict) -> go.Figure:
-    """年度勝率與信號數"""
-    if not by_year:
+def build_equity_curve(trades: list) -> go.Figure:
+    if not trades:
         return go.Figure()
-    years     = [str(y) for y in sorted(by_year.keys())]
-    win_rates = [by_year[int(y)]["win_rate"] for y in years]
-    totals    = [by_year[int(y)]["total"]    for y in years]
-    avg_pnls  = [by_year[int(y)]["avg_pnl"] for y in years]
+    df_t    = pd.DataFrame(trades)
+    cum     = df_t["pnl_pct"].cumsum().values
+    colors  = ["#3d8b5e" if p > 0 else "#c0392b" for p in df_t["pnl_pct"]]
+    xlabels = [str(t["entry_time"])[:16] for t in trades]
 
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Bar(
-        x=years, y=win_rates, name="年度勝率 %",
-        marker_color=["#3d8b5e" if r>=50 else "#c0392b" for r in win_rates],
-        opacity=0.8,
-        text=[f"{r:.0f}%" for r in win_rates],
-        textposition="outside",
-    ), secondary_y=False)
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.6, 0.4], vertical_spacing=0.06,
+                        subplot_titles=["累計收益（%）", "每筆盈虧（%）"])
     fig.add_trace(go.Scatter(
-        x=years, y=totals, name="信號數",
-        mode="lines+markers+text",
-        line=dict(color="#e07b39", width=2),
-        marker=dict(size=7),
-        text=totals, textposition="top center",
-        textfont=dict(size=10),
-    ), secondary_y=True)
-
-    fig.add_hline(y=50, line_dash="dash", line_color="#aaa",
-                  annotation_text="50%", secondary_y=False)
+        x=xlabels, y=cum, mode="lines+markers",
+        name="累計收益", line=dict(color="#5a7fa8", width=2),
+        fill="tozeroy", fillcolor="rgba(90,127,168,0.08)",
+        marker=dict(size=5, color=colors),
+    ), row=1, col=1)
+    fig.add_hline(y=0, line_dash="dot", line_color="#aaa", row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=xlabels, y=df_t["pnl_pct"].values,
+        name="單筆", marker_color=colors, opacity=0.85,
+    ), row=2, col=1)
+    fig.add_hline(y=0, line_dash="dot", line_color="#aaa", row=2, col=1)
+    step = max(1, len(xlabels)//10)
+    tv   = xlabels[::step]
     fig.update_layout(
         paper_bgcolor="#fff8f0", plot_bgcolor="#fff8f0",
-        font=dict(family="IBM Plex Mono, Noto Sans TC", color="#2c2c2c", size=11),
-        margin=dict(l=10, r=10, t=10, b=10),
-        height=260,
-        legend=dict(orientation="h", y=1.1, x=0),
-        barmode="group",
+        font=dict(family="IBM Plex Mono", color="#2c2c2c", size=10),
+        margin=dict(l=10, r=10, t=36, b=10), height=380, showlegend=False,
+        xaxis=dict(type="category", tickvals=tv, tickangle=-35, gridcolor="#e8e3da"),
+        xaxis2=dict(type="category", tickvals=tv, tickangle=-35, gridcolor="#e8e3da"),
     )
-    fig.update_xaxes(gridcolor="#e8e3da", type="category")
-    fig.update_yaxes(gridcolor="#e8e3da", range=[0,110], title_text="勝率 %", secondary_y=False)
-    fig.update_yaxes(gridcolor="#e8e3da", title_text="信號數", secondary_y=True)
+    fig.update_yaxes(gridcolor="#e8e3da", zeroline=True, zerolinecolor="#c0bbb2")
     return fig
 
 
-def render_bt_summary(result: dict, symbol: str, period_label: str,
-                       hold_days: int, atr_sl: float, atr_tp: float) -> str:
-    """回測摘要指標卡 HTML"""
+def render_bt_kpi(result: dict, symbol: str, hold_bars: int,
+                   atr_sl: float, atr_tp: float) -> str:
     wr  = result["win_rate"]
     pf  = result["profit_factor"]
-    wr_color  = "#3d8b5e" if wr  >= 55 else ("#e07b39" if wr  >= 45 else "#c0392b")
-    pf_color  = "#3d8b5e" if pf  >= 1.5 else ("#e07b39" if pf  >= 1.0 else "#c0392b")
-    tr_color  = "#3d8b5e" if result["total_return"] >= 0 else "#c0392b"
-
+    tr  = result["total_return"]
+    wc  = "#3d8b5e" if wr >= 55 else ("#e07b39" if wr >= 45 else "#c0392b")
+    pc_ = "#3d8b5e" if pf >= 1.5 else ("#e07b39" if pf >= 1.0 else "#c0392b")
+    tc  = "#3d8b5e" if tr >= 0   else "#c0392b"
     return f"""
-    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:12px 0;">
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:14px 0;">
         <div class="metric-card">
-            <div class="label">總信號數</div>
-            <div class="value" style="font-size:28px;">{result['total']}</div>
-            <div class="sub">{period_label} · 日線</div>
+            <div class="label">總信號</div>
+            <div class="value" style="font-size:30px;">{result['total']}</div>
+            <div class="sub">最近60天 30m</div>
         </div>
         <div class="metric-card">
             <div class="label">整體勝率</div>
-            <div class="value" style="color:{wr_color};font-size:28px;">{wr:.1f}%</div>
-            <div class="sub">{result['wins']}勝 / {result['losses']}負</div>
+            <div class="value" style="color:{wc};font-size:30px;">{wr:.1f}%</div>
+            <div class="sub">{result['wins']}勝 {result['losses']}負</div>
         </div>
         <div class="metric-card">
-            <div class="label">盈虧比 (PF)</div>
-            <div class="value" style="color:{pf_color};font-size:28px;">{pf:.2f}</div>
-            <div class="sub">平均勝 {result['avg_win']:.2f}% / 負 {result['avg_loss']:.2f}%</div>
+            <div class="label">盈虧比 PF</div>
+            <div class="value" style="color:{pc_};font-size:30px;">{pf:.2f}</div>
+            <div class="sub">勝 {result['avg_win']:.2f}% / 負 {result['avg_loss']:.2f}%</div>
         </div>
         <div class="metric-card">
             <div class="label">最大連虧</div>
-            <div class="value" style="color:#c0392b;font-size:28px;">{result['max_consec_loss']}</div>
-            <div class="sub">連續虧損次數</div>
+            <div class="value" style="color:#c0392b;font-size:30px;">{result['max_consec_loss']}</div>
+            <div class="sub">連續次數</div>
         </div>
         <div class="metric-card">
             <div class="label">累計收益</div>
-            <div class="value" style="color:{tr_color};font-size:28px;">{result['total_return']:+.1f}%</div>
-            <div class="sub">持倉{hold_days}日 · SL {atr_sl}×ATR · TP {atr_tp}×ATR</div>
+            <div class="value" style="color:{tc};font-size:30px;">{tr:+.1f}%</div>
+            <div class="sub">持{hold_bars}根·SL {atr_sl}×·TP {atr_tp}×ATR</div>
         </div>
     </div>"""
 
 
-def render_trades_table(trades: list, max_rows: int = 20) -> str:
-    """逐筆交易明細表"""
-    cols = ["入場日期","出場日期","入場價","出場價","持倉根","盈虧%","結果","出場原因"]
+def render_trades_table(trades: list, max_rows: int = 25) -> str:
+    cols = ["入場時間","出場時間","入場價","出場價","持倉根","盈虧%","結果","原因"]
     hdr  = "".join(f"<th>{c}</th>" for c in cols)
     body = ""
+    reason_cls = {"止損":"badge-bear","止盈":"badge-bull","到期平倉":"badge-neu"}
     for t in trades[-max_rows:]:
-        pnl  = t["pnl_pct"]
-        pc_  = "cell-pos" if pnl >= 0 else "cell-neg"
-        rslt = '<span class="badge badge-bull">▲ 盈利</span>' if t["win"] else '<span class="badge badge-bear">▼ 虧損</span>'
-        reason_map = {"止損":"badge-bear","止盈":"badge-bull","到期平倉":"badge-neu"}
-        rc = reason_map.get(t["exit_reason"], "badge-neu")
-        reason_badge = f'<span class="badge {rc}">{t["exit_reason"]}</span>'
-        ed = pd.Timestamp(t["entry_date"]).strftime("%m/%d/%Y")
-        xd = pd.Timestamp(t["exit_date"]).strftime("%m/%d/%Y")
+        pnl = t["pnl_pct"]
+        pc_ = "cell-pos" if pnl >= 0 else "cell-neg"
+        rslt= '<span class="badge badge-bull">▲ 盈</span>' if t["win"]               else '<span class="badge badge-bear">▼ 虧</span>'
+        rc  = reason_cls.get(t["exit_reason"], "badge-neu")
+        rb  = f'<span class="badge {rc}">{t["exit_reason"]}</span>'
+        et  = str(t["entry_time"])[:16]
+        xt  = str(t["exit_time"])[:16]
         body += f"""<tr>
-            <td>{ed}</td><td>{xd}</td>
+            <td>{et}</td><td>{xt}</td>
             <td>{t['entry_price']:.2f}</td><td>{t['exit_price']:.2f}</td>
-            <td>{t.get('bars_held', t.get('days_held', '-'))}</td>
+            <td>{t['bars_held']}</td>
             <td class="{pc_}">{pnl:+.2f}%</td>
-            <td>{rslt}</td><td>{reason_badge}</td>
+            <td>{rslt}</td><td>{rb}</td>
         </tr>"""
     return f'<table class="macd-table"><thead><tr>{hdr}</tr></thead><tbody>{body}</tbody></table>'
 
@@ -1253,167 +1300,140 @@ if tg_send:
 # ══════════════════════════════════════════════════════════════
 # 回測區塊（主頁面底部）
 # ══════════════════════════════════════════════════════════════
-st.markdown("# 📊 信號回測分析")
+st.markdown("# 📊 三步瀑布傳導回測")
 st.markdown("""
-<div style="font-size:12px;color:#888;font-family:'IBM Plex Mono',monospace;margin-bottom:8px;">
-基於你的設計原理：Histogram 空頭縮減 + D+1 預測翻正 → 模擬入場，ATR 止損/止盈/到期平倉
+<div style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#888;
+            background:#fff8f0;border:1px solid #d4cfc6;border-left:4px solid #5a7fa8;
+            border-radius:8px;padding:12px 16px;margin-bottom:12px;line-height:1.9;">
+<b>回測邏輯（忠實還原三步入場）：</b><br>
+Step 1 &nbsp;→&nbsp; 1d + 1h Histogram > 0 &nbsp;（大方向多頭確認）<br>
+Step 2 &nbsp;→&nbsp; 5m D+1 > 0 &nbsp;+&nbsp; 15m D+1 > 0 &nbsp;+&nbsp; 30m D+1 > 0 &nbsp;（傳導鏈預警）<br>
+Step 3 &nbsp;→&nbsp; 30m Histogram 前根 &lt; 0 → 當根 ≥ 0 &nbsp;（實際翻正，執行入場）<br>
+<b>數據範圍：最近 60 天日內數據（5m / 15m / 30m / 1h / 1d）</b>
 </div>
 """, unsafe_allow_html=True)
 st.markdown("---")
 
-# 回測設定
-bt_col1, bt_col2, bt_col3, bt_col4 = st.columns(4)
-with bt_col1:
+# ── 回測參數設定 ──────────────────────────────────────────────
+bc1, bc2, bc3 = st.columns(3)
+with bc1:
     bt_symbols = st.multiselect(
         "回測股票",
         symbols if symbols else DEFAULT_SYMBOLS,
         default=symbols[:1] if symbols else ["TSLA"],
     )
-with bt_col2:
-    bt_period_label = st.selectbox("回測周期", list(BACKTEST_PERIODS.keys()), index=1)
-    bt_period       = BACKTEST_PERIODS[bt_period_label]
-with bt_col3:
-    bt_hold    = st.slider("持倉K線根數", 3, 40, 10, help="1h模式=小時根數，1d模式=天數")
-    bt_atr_sl  = st.slider("止損 (×ATR)", 0.5, 3.0, 1.5, 0.5)
-with bt_col4:
-    bt_atr_tp  = st.slider("止盈 (×ATR)", 1.0, 5.0, 3.0, 0.5)
-    run_bt     = st.button("🚀 開始回測", type="primary")
+with bc2:
+    bt_hold   = st.slider("持倉根數（30m K 線）", 3, 24, 6)
+    bt_atr_sl = st.slider("止損 (×ATR)", 0.5, 3.0, 1.5, 0.5)
+with bc3:
+    bt_atr_tp = st.slider("止盈 (×ATR)", 1.0, 6.0, 3.0, 0.5)
+    run_bt    = st.button("🚀 開始回測", type="primary", use_container_width=True)
 
 if run_bt and bt_symbols:
     for bt_sym in bt_symbols:
-        st.markdown(f"## 📈 {bt_sym} — {bt_period_label}回測")
+        st.markdown(f"## 📈 {bt_sym}  —  最近60天 三步瀑布回測")
 
-        with st.spinner(f"載入 {bt_sym} 所有時框數據（1w / 1d / 4h / 1h）..."):
-            layers = fetch_backtest_layers(bt_sym)
+        with st.spinner(f"載入 {bt_sym} 多時框數據並計算..."):
+            result = run_cascade_backtest(
+                bt_sym, atr_sl=bt_atr_sl, atr_tp=bt_atr_tp, hold_bars=bt_hold
+            )
 
-        # 根據回測周期選擇數據範圍
-        long_period = bt_period_label in ["5年","10年"]
-        df_check = layers.get("1h") if not long_period else layers.get("1d")
-        if df_check is None or df_check.empty or len(df_check) < 60:
-            st.warning(f"⚠️ {bt_sym} {'1h' if not long_period else '1d'} 數據不足，無法回測")
+        # 錯誤處理
+        if "error" in result:
+            st.error(f"⚠️ {bt_sym}：{result['error']}")
             continue
 
-        if long_period:
-            # 5y/10y：截取對應長度
-            cutoff = {"5年": 365*5, "10年": 365*10}[bt_period_label]
-            from datetime import timedelta
-            cutoff_date = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=cutoff)
-            for k in ["1w","1d"]:
-                if layers.get(k) is not None and not layers[k].empty:
-                    idx = pd.to_datetime(layers[k].index, utc=True)
-                    layers[k] = layers[k][idx >= cutoff_date]
-
-        result = run_backtest(
-            layers,
-            period_label = bt_period_label,
-            hold_bars    = bt_hold,
-            atr_sl       = bt_atr_sl,
-            atr_tp       = bt_atr_tp,
-        )
-
-        if not result or result.get("total", 0) == 0:
-            st.warning(f"⚠️ {bt_sym} 回測期間未找到信號，請調整參數")
+        if result.get("total", 0) == 0:
+            st.warning(f"⚠️ {bt_sym}：60天內未找到符合三步條件的入場信號")
+            st.info("可能原因：1d / 1h 未同時處於多頭，或傳導鏈未完整對齊。請確認目前大方向。")
             continue
 
-        # ── 摘要指標卡 ────────────────────────────────────
-        trig_tf_label = result.get("trigger_tf","1h")
-        st.markdown(f"""
-        <div style="font-size:12px;color:#888;font-family:'IBM Plex Mono',monospace;margin-bottom:8px;">
-        入場觸發時框：<b>{trig_tf_label}</b>
-        &nbsp;|&nbsp; 確認層：{'1w + 1d + 4h' if trig_tf_label=='1h' else '1w + 1d'}
-        &nbsp;|&nbsp; 持倉 {bt_hold} 根K線 · 止損 {bt_atr_sl}×ATR · 止盈 {bt_atr_tp}×ATR
-        </div>
-        """, unsafe_allow_html=True)
-        st.markdown(render_bt_summary(result, bt_sym, bt_period_label, bt_hold, bt_atr_sl, bt_atr_tp),
+        # ── KPI 卡片 ──────────────────────────────────────
+        st.markdown(render_bt_kpi(result, bt_sym, bt_hold, bt_atr_sl, bt_atr_tp),
                     unsafe_allow_html=True)
 
-        # ── 圖表區 ────────────────────────────────────────
-        ch1, ch2 = st.columns([3, 2])
-        with ch1:
-            st.markdown("##### 📉 累計收益曲線")
-            fig_eq = build_equity_curve(result["trades"])
-            st.plotly_chart(fig_eq, use_container_width=True)
-        with ch2:
-            st.markdown("##### 📅 年度勝率分佈")
-            fig_yr = build_yearly_chart(result["by_year"])
-            st.plotly_chart(fig_yr, use_container_width=True)
+        # ── 主圖：入場標注在 30m 圖上 ───────────────────────
+        st.markdown("##### 🎯 30m K線入場/出場標注圖")
+        st.markdown("""
+        <div style="font-size:11px;color:#aaa;font-family:'IBM Plex Mono',monospace;margin-bottom:6px;">
+        ▲ 綠色三角 = 盈利入場 &nbsp;|&nbsp; ▲ 紅色三角 = 虧損入場 &nbsp;|&nbsp;
+        橙色虛線 = D+1預測（翻正即觸發Step2）
+        </div>""", unsafe_allow_html=True)
+        fig_entry = build_bt_entry_chart(result["aligned"], result["trades"])
+        st.plotly_chart(fig_entry, use_container_width=True)
 
-        # ── 年度明細表 ────────────────────────────────────
-        with st.expander("📊 年度統計明細"):
-            by_year = result["by_year"]
-            yr_rows = ""
-            for yr in sorted(by_year.keys()):
-                d   = by_year[yr]
-                wrc = "#3d8b5e" if d["win_rate"]>=55 else ("#e07b39" if d["win_rate"]>=45 else "#c0392b")
-                pc_ = "#3d8b5e" if d["avg_pnl"]>=0 else "#c0392b"
-                yr_rows += f"""<tr>
-                    <td>{yr}</td>
-                    <td>{d['total']}</td>
-                    <td>{d['wins']}</td>
-                    <td style="color:{wrc};font-weight:700;">{d['win_rate']:.1f}%</td>
-                    <td style="color:{pc_};font-weight:700;">{d['avg_pnl']:+.2f}%</td>
-                </tr>"""
-            yr_hdr = "".join(f"<th>{c}</th>" for c in ["年份","總信號","勝","勝率","平均盈虧"])
-            st.markdown(
-                f'<table class="macd-table"><thead><tr>{yr_hdr}</tr></thead><tbody>{yr_rows}</tbody></table>',
-                unsafe_allow_html=True)
+        # ── 副圖：權益曲線 ────────────────────────────────
+        st.markdown("##### 📉 累計收益曲線")
+        fig_eq = build_equity_curve(result["trades"])
+        st.plotly_chart(fig_eq, use_container_width=True)
 
-        # ── 逐筆交易明細 ──────────────────────────────────
-        with st.expander("🔍 最近20筆交易明細"):
-            st.markdown(render_trades_table(result["trades"], max_rows=20),
-                        unsafe_allow_html=True)
+        # ── 出場原因分析 ──────────────────────────────────
+        col_pie, col_reason, col_extreme = st.columns(3)
+        df_t_bt = pd.DataFrame(result["trades"])
 
-        # ── 出場原因分佈 ──────────────────────────────────
-        with st.expander("📐 出場原因分析"):
-            df_trades_bt = pd.DataFrame(result["trades"])
-            reason_counts = df_trades_bt["exit_reason"].value_counts()
-            fig_reason = go.Figure(go.Pie(
-                labels=reason_counts.index.tolist(),
-                values=reason_counts.values.tolist(),
+        with col_pie:
+            st.markdown("##### 出場原因分佈")
+            rc_counts = df_t_bt["exit_reason"].value_counts()
+            fig_pie = go.Figure(go.Pie(
+                labels=rc_counts.index.tolist(),
+                values=rc_counts.values.tolist(),
                 marker=dict(colors=["#c0392b","#3d8b5e","#5a7fa8"]),
-                textinfo="label+percent",
-                hole=0.4,
+                textinfo="label+percent", hole=0.4,
             ))
-            fig_reason.update_layout(
+            fig_pie.update_layout(
                 paper_bgcolor="#fff8f0",
-                font=dict(family="IBM Plex Mono", size=12),
-                margin=dict(l=10,r=10,t=10,b=10),
-                height=280,
-                showlegend=False,
+                font=dict(family="IBM Plex Mono", size=11),
+                margin=dict(l=0,r=0,t=10,b=0), height=220, showlegend=False,
             )
-            rc1, rc2, rc3 = st.columns(3)
-            with rc1:
-                st.plotly_chart(fig_reason, use_container_width=True)
-            with rc2:
-                # 勝率 by 出場原因
-                for reason in df_trades_bt["exit_reason"].unique():
-                    sub = df_trades_bt[df_trades_bt["exit_reason"]==reason]
-                    wr_r = sub["win"].mean()*100 if len(sub)>0 else 0
-                    wrc  = "#3d8b5e" if wr_r>=55 else ("#e07b39" if wr_r>=45 else "#c0392b")
-                    st.markdown(f"""<div class="metric-card" style="margin-bottom:8px;">
-                        <div class="label">{reason} 勝率</div>
-                        <div class="value" style="color:{wrc};font-size:22px;">{wr_r:.1f}%</div>
-                        <div class="sub">{len(sub)} 筆 · 平均 {sub['pnl_pct'].mean():+.2f}%</div>
-                    </div>""", unsafe_allow_html=True)
-            with rc3:
-                # 最佳/最差
-                best  = df_trades_bt.loc[df_trades_bt["pnl_pct"].idxmax()]
-                worst = df_trades_bt.loc[df_trades_bt["pnl_pct"].idxmin()]
-                st.markdown(f"""<div class="metric-card" style="margin-bottom:8px;border:1px solid #3d8b5e;">
-                    <div class="label">🏆 最佳交易</div>
-                    <div class="value pos">{best['pnl_pct']:+.2f}%</div>
-                    <div class="sub">{pd.Timestamp(best['entry_date']).strftime('%Y/%m/%d')} 入場</div>
-                </div>
-                <div class="metric-card" style="border:1px solid #c0392b;">
-                    <div class="label">💥 最差交易</div>
-                    <div class="value neg">{worst['pnl_pct']:+.2f}%</div>
-                    <div class="sub">{pd.Timestamp(worst['entry_date']).strftime('%Y/%m/%d')} 入場</div>
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        with col_reason:
+            st.markdown("##### 各出場方式勝率")
+            for reason in ["止損","止盈","到期平倉"]:
+                sub = df_t_bt[df_t_bt["exit_reason"]==reason]
+                if len(sub) == 0: continue
+                wr_r = sub["win"].mean()*100
+                wc_r = "#3d8b5e" if wr_r>=55 else ("#e07b39" if wr_r>=45 else "#c0392b")
+                st.markdown(f"""<div class="metric-card" style="margin-bottom:8px;">
+                    <div class="label">{reason}</div>
+                    <div class="value" style="color:{wc_r};font-size:20px;">{wr_r:.1f}%</div>
+                    <div class="sub">{len(sub)}筆 · 均 {sub['pnl_pct'].mean():+.2f}%</div>
                 </div>""", unsafe_allow_html=True)
+
+        with col_extreme:
+            st.markdown("##### 最佳 / 最差")
+            best  = df_t_bt.loc[df_t_bt["pnl_pct"].idxmax()]
+            worst = df_t_bt.loc[df_t_bt["pnl_pct"].idxmin()]
+            st.markdown(f"""
+            <div class="metric-card" style="margin-bottom:8px;border:1.5px solid #3d8b5e;">
+                <div class="label">🏆 最佳交易</div>
+                <div class="value pos">{best['pnl_pct']:+.2f}%</div>
+                <div class="sub">{str(best['entry_time'])[:16]}</div>
+                <div class="sub">{best['exit_reason']}</div>
+            </div>
+            <div class="metric-card" style="border:1.5px solid #c0392b;">
+                <div class="label">💥 最差交易</div>
+                <div class="value neg">{worst['pnl_pct']:+.2f}%</div>
+                <div class="sub">{str(worst['entry_time'])[:16]}</div>
+                <div class="sub">{worst['exit_reason']}</div>
+            </div>""", unsafe_allow_html=True)
+
+        # ── 逐筆明細 ──────────────────────────────────────
+        with st.expander("🔍 逐筆交易明細（最近25筆）"):
+            st.markdown(render_trades_table(result["trades"], max_rows=25),
+                        unsafe_allow_html=True)
 
         st.markdown("---")
 
 elif not run_bt:
-    st.info("👆 選擇股票和回測周期，點擊「開始回測」查看歷史信號成功率")
+    st.markdown("""
+    <div style="text-align:center;padding:40px;color:#aaa;
+                font-family:'IBM Plex Mono',monospace;font-size:13px;">
+    👆 選擇股票，設定參數，點擊「開始回測」<br><br>
+    系統將嚴格按照三步入場邏輯，在最近60天30m K線上<br>
+    模擬每一個信號的入場和出場，統計真實成功率
+    </div>
+    """, unsafe_allow_html=True)
 
 st.markdown("""
 <div style='text-align:center;color:#bbb;font-size:11px;margin-top:20px;
