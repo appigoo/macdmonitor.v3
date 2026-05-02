@@ -843,7 +843,7 @@ def run_backtest(
     }
 
 
-def build_equity_curve(df_main: pd.DataFrame, trades: list) -> go.Figure:
+def build_equity_curve(trades: list) -> go.Figure:
     """權益曲線圖"""
     if not trades:
         return go.Figure()
@@ -1331,7 +1331,7 @@ if run_bt and bt_symbols:
         ch1, ch2 = st.columns([3, 2])
         with ch1:
             st.markdown("##### 📉 累計收益曲線")
-            fig_eq = build_equity_curve(df_bt, result["trades"])
+            fig_eq = build_equity_curve(result["trades"])
             st.plotly_chart(fig_eq, use_container_width=True)
         with ch2:
             st.markdown("##### 📅 年度勝率分佈")
