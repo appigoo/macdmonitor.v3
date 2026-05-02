@@ -723,17 +723,19 @@ def run_cascade_backtest(symbol: str, atr_sl: float = 1.5,
     """
     三步瀑布傳導回測（最近 60 天 30m K 線）
 
-    Step1: h1d > 0 AND h1h > 0                   ← 大方向多頭
-    Step2: d1_5 > 0 AND d1_15 > 0 AND d1_30 > 0  ← 傳導鏈 D+1 預測翻正
-           (5m → 15m → 30m 預測鏈對齊)
-    Step3: h30 前一根 < 0，當根 >= 0              ← 30m 實際翻正，入場
-
-    出場：
-      - 持倉 hold_bars 根 30m K 線後平倉
-      - 或跌破 sl = 入場價 - atr_sl × ATR(30m)
-      - 或漲過 tp = 入場價 + atr_tp × ATR(30m)
+    正確的三步時序邏輯：
+    ┌─ 每根 K 線持續檢查 ──────────────────────────────────┐
+    │ Step 1  h1d > 0 AND h1h > 0   → 大方向多頭確認      │
+    │ Step 2  預警根：h30 < 0                              │
+    │         AND d1_5>0, d1_15>0, d1_30>0               │
+    │         （傳導鏈 D+1 全部預測翻正，但30m尚未翻）     │
+    │ Step 3  入場根（預警根的下一根）：                   │
+    │         h30_prev < 0 AND h30_now >= 0               │
+    │         （30m 實際翻正 → 當根收盤入場）              │
+    └──────────────────────────────────────────────────────┘
+    出場：持倉 hold_bars 根 / ATR 止損 / ATR 止盈
     """
-    # 載入所有時框
+    # ── 載入所有時框 ─────────────────────────────────────
     dfs = {}
     for tf, cfg in BT_INTRADAY_CONFIGS.items():
         df = fetch_bt_tf(symbol, cfg["period"], cfg["interval"])
@@ -741,7 +743,7 @@ def run_cascade_backtest(symbol: str, atr_sl: float = 1.5,
             return {"error": f"{tf} 數據載入失敗"}
         dfs[tf] = df
 
-    # 對齊到 30m 軸
+    # ── 時框對齊 ─────────────────────────────────────────
     try:
         aligned = align_to_30m(
             dfs["30m"], dfs["5m"], dfs["15m"], dfs["1h"], dfs["1d"]
@@ -752,14 +754,22 @@ def run_cascade_backtest(symbol: str, atr_sl: float = 1.5,
     if len(aligned) < 20:
         return {"error": "有效數據不足20根30m K線"}
 
-    # 計算 ATR(30m)
-    _, _, hist_30m_full = calc_macd(dfs["30m"]["Close"])
     atr_30m = calc_atr(dfs["30m"])
 
-    # 主回測循環
-    trades   = []
-    in_trade = False
-    entry_price = entry_bar = None
+    # ── 診斷計數器（找出哪一步卡住）─────────────────────
+    diag = {
+        "total_bars":    len(aligned),
+        "step1_pass":    0,   # 1d+1h 都多頭的 bar 數
+        "step2_alert":   0,   # Step2 預警觸發次數
+        "step3_entry":   0,   # Step3 實際入場次數
+        "skip_nan":      0,
+    }
+
+    # ── 主回測循環 ────────────────────────────────────────
+    trades        = []
+    in_trade      = False
+    entry_price   = entry_bar = None
+    prev_alerted  = False   # 上一根是否已發出 Step2 預警
 
     close_arr = aligned["close"].values
     h30_arr   = aligned["h30"].values
@@ -771,49 +781,65 @@ def run_cascade_backtest(symbol: str, atr_sl: float = 1.5,
     times     = aligned.index
 
     for i in range(5, len(aligned)):
+        # NaN 跳過
         if np.isnan(h30_arr[i]) or np.isnan(close_arr[i]):
+            diag["skip_nan"] += 1
+            prev_alerted = False
             continue
 
         if not in_trade:
             # ── Step 1：大方向確認 ─────────────────────────
-            step1 = (
-                not np.isnan(h1d_arr[i]) and h1d_arr[i] > 0 and   # 1d 多頭
-                not np.isnan(h1h_arr[i]) and h1h_arr[i] > 0        # 1h 多頭
-            )
+            s1_1d = (not np.isnan(h1d_arr[i]) and h1d_arr[i] > 0)
+            s1_1h = (not np.isnan(h1h_arr[i]) and h1h_arr[i] > 0)
+            step1 = s1_1d and s1_1h
+            if step1:
+                diag["step1_pass"] += 1
+
             if not step1:
+                prev_alerted = False
                 continue
 
-            # ── Step 2：傳導鏈 D+1 預測翻正 ───────────────
-            step2 = (
-                not np.isnan(d1_5_arr[i])  and d1_5_arr[i]  > 0 and  # 5m D+1 轉正
-                not np.isnan(d1_15_arr[i]) and d1_15_arr[i] > 0 and  # 15m D+1 轉正
-                not np.isnan(d1_30_arr[i]) and d1_30_arr[i] > 0 and  # 30m D+1 轉正
-                h30_arr[i] < 0                                         # 30m 當前仍負
-            )
-            if not step2:
-                continue
+            # ── Step 3 優先：上一根已預警，本根是否翻正？──
+            if prev_alerted:
+                h30_prev = h30_arr[i-1]
+                step3 = (h30_prev < 0 and h30_arr[i] >= 0)
+                if step3:
+                    in_trade    = True
+                    entry_bar   = i
+                    entry_price = close_arr[i]
+                    diag["step3_entry"] += 1
+                    prev_alerted = False
+                    continue
+                # 若上一根預警後本根仍負，繼續等（不重置 prev_alerted，
+                # 但要重新判斷 Step2 是否仍然成立）
 
-            # ── Step 3：30m 實際翻正 → 入場 ───────────────
-            h30_prev = h30_arr[i-1] if i > 0 else h30_arr[i]
-            step3 = (h30_prev < 0 and h30_arr[i] >= 0)
+            # ── Step 2：傳導鏈 D+1 預測翻正（預警根）─────
+            s2_5m  = (not np.isnan(d1_5_arr[i])  and d1_5_arr[i]  > 0)
+            s2_15m = (not np.isnan(d1_15_arr[i]) and d1_15_arr[i] > 0)
+            s2_30m = (not np.isnan(d1_30_arr[i]) and d1_30_arr[i] > 0)
+            s2_neg = (h30_arr[i] < 0)   # 30m 當前仍為負（尚未翻正）
 
-            if step3:
-                in_trade    = True
-                entry_bar   = i
-                entry_price = close_arr[i]
+            step2 = s2_5m and s2_15m and s2_30m and s2_neg
+            if step2:
+                prev_alerted = True
+                diag["step2_alert"] += 1
+            else:
+                # Step2 不滿足，重置預警狀態
+                prev_alerted = False
 
         else:
             # ── 出場檢測 ──────────────────────────────────
+            prev_alerted = False
             bars_held = i - entry_bar
-            cur       = close_arr[i]
-            sl        = entry_price - atr_sl * atr_30m
-            tp        = entry_price + atr_tp * atr_30m
+            cur  = close_arr[i]
+            sl   = entry_price - atr_sl * atr_30m
+            tp   = entry_price + atr_tp * atr_30m
 
             reason = exit_price = None
             if cur <= sl:
-                reason, exit_price = "止損", max(sl, cur)
+                reason, exit_price = "止損",    max(sl, cur)
             elif cur >= tp:
-                reason, exit_price = "止盈", min(tp, cur)
+                reason, exit_price = "止盈",    min(tp, cur)
             elif bars_held >= hold_bars:
                 reason, exit_price = "到期平倉", cur
 
@@ -830,7 +856,7 @@ def run_cascade_backtest(symbol: str, atr_sl: float = 1.5,
                     "exit_reason": reason,
                     "date":        pd.Timestamp(times[entry_bar]).date(),
                 })
-                in_trade = in_trade = False
+                in_trade    = False
                 entry_price = entry_bar = None
 
     if not trades:
@@ -838,7 +864,7 @@ def run_cascade_backtest(symbol: str, atr_sl: float = 1.5,
             "trades": [], "total": 0, "wins": 0, "losses": 0,
             "win_rate": 0, "avg_win": 0, "avg_loss": 0,
             "profit_factor": 0, "max_consec_loss": 0,
-            "total_return": 0, "aligned": aligned,
+            "total_return": 0, "aligned": aligned, "diag": diag,
         }
 
     df_t   = pd.DataFrame(trades)
@@ -868,6 +894,7 @@ def run_cascade_backtest(symbol: str, atr_sl: float = 1.5,
         "max_consec_loss": mc,
         "total_return":    df_t["pnl_pct"].sum(),
         "aligned":         aligned,
+        "diag":            diag,
     }
 
 
@@ -1341,8 +1368,45 @@ if run_bt and bt_symbols:
             continue
 
         if result.get("total", 0) == 0:
-            st.warning(f"⚠️ {bt_sym}：60天內未找到符合三步條件的入場信號")
-            st.info("可能原因：1d / 1h 未同時處於多頭，或傳導鏈未完整對齊。請確認目前大方向。")
+            diag = result.get("diag", {})
+            total_bars  = diag.get("total_bars",  "?")
+            step1_pass  = diag.get("step1_pass",  0)
+            step2_alert = diag.get("step2_alert", 0)
+            step3_entry = diag.get("step3_entry", 0)
+
+            # 找出卡在哪一步
+            if step1_pass == 0:
+                bottleneck = "❌ Step 1 從未通過：1d / 1h Histogram 未同時 > 0（大方向未確認多頭）"
+                tip = "目前市場可能處於空頭或震盪。建議等待 1d 和 1h 同時翻正後再回測。"
+            elif step2_alert == 0:
+                bottleneck = "❌ Step 2 從未觸發：Step1 通過但傳導鏈 D+1 未同時預測翻正"
+                tip = "5m / 15m / 30m 的 D+1 預測未能同時 > 0。可能是震盪市，或者 5m 數據 yfinance 只能取 7天，可能不足。"
+            elif step3_entry == 0:
+                bottleneck = "❌ Step 3 從未入場：預警發出但 30m Histogram 翻正時 Step1 已失效"
+                tip = "預警發出的下一根 K 線，1d 或 1h 已轉負。市場變化快，大方向短暫失效。可嘗試放寬 Step1 條件。"
+            else:
+                bottleneck = "⚠️ 信號找到但未生成交易記錄，請檢查數據"
+                tip = ""
+
+            st.warning(f"⚠️ {bt_sym}：60天內未找到完整三步入場信號")
+            st.markdown(f"""
+            <div style="background:#fff8f0;border:1px solid #d4cfc6;border-radius:10px;
+                        padding:16px 20px;font-family:'IBM Plex Mono',monospace;font-size:12px;
+                        line-height:2;">
+            <b>📊 診斷報告</b><br>
+            ─────────────────────────────────────<br>
+            總 30m K 線數：<b>{total_bars}</b> 根<br>
+            Step 1 通過（1d+1h 同時多頭）：<b>{step1_pass}</b> 根
+            &nbsp;{"✅" if step1_pass > 0 else "❌"}<br>
+            Step 2 預警觸發（傳導鏈D+1翻正）：<b>{step2_alert}</b> 次
+            &nbsp;{"✅" if step2_alert > 0 else "❌"}<br>
+            Step 3 實際入場（30m翻正）：<b>{step3_entry}</b> 次
+            &nbsp;{"✅" if step3_entry > 0 else "❌"}<br>
+            ─────────────────────────────────────<br>
+            <b>瓶頸：</b>{bottleneck}<br>
+            <b>建議：</b>{tip}
+            </div>
+            """, unsafe_allow_html=True)
             continue
 
         # ── KPI 卡片 ──────────────────────────────────────
