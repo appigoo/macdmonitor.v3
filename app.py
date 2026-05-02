@@ -972,7 +972,7 @@ def render_bt_summary(result: dict, symbol: str, period_label: str,
 
 def render_trades_table(trades: list, max_rows: int = 20) -> str:
     """逐筆交易明細表"""
-    cols = ["入場日期","出場日期","入場價","出場價","持倉天","盈虧%","結果","出場原因"]
+    cols = ["入場日期","出場日期","入場價","出場價","持倉根","盈虧%","結果","出場原因"]
     hdr  = "".join(f"<th>{c}</th>" for c in cols)
     body = ""
     for t in trades[-max_rows:]:
@@ -987,7 +987,7 @@ def render_trades_table(trades: list, max_rows: int = 20) -> str:
         body += f"""<tr>
             <td>{ed}</td><td>{xd}</td>
             <td>{t['entry_price']:.2f}</td><td>{t['exit_price']:.2f}</td>
-            <td>{t['days_held']}</td>
+            <td>{t.get('bars_held', t.get('days_held', '-'))}</td>
             <td class="{pc_}">{pnl:+.2f}%</td>
             <td>{rslt}</td><td>{reason_badge}</td>
         </tr>"""
