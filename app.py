@@ -719,7 +719,8 @@ def align_to_30m(df_30m: pd.DataFrame,
 
 
 def run_cascade_backtest(symbol: str, atr_sl: float = 1.5,
-                          atr_tp: float = 3.0, hold_bars: int = 6) -> dict:
+                          atr_tp: float = 3.0, hold_bars: int = 6,
+                          exit_mode: str = "固定根數") -> dict:
     """
     三步瀑布傳導回測（最近 60 天 30m K 線）
 
@@ -733,7 +734,11 @@ def run_cascade_backtest(symbol: str, atr_sl: float = 1.5,
     │         h30_prev < 0 AND h30_now >= 0               │
     │         （30m 實際翻正 → 當根收盤入場）              │
     └──────────────────────────────────────────────────────┘
-    出場：持倉 hold_bars 根 / ATR 止損 / ATR 止盈
+    出場模式（exit_mode）：
+      "固定根數"    → 持倉 hold_bars 根 30m K 線後平倉
+      "30m轉負"     → 30m Histogram 再次轉負時出場
+      "1d/1h轉負"   → 1d 或 1h Histogram 轉負時出場（跟隨大趨勢）
+    所有模式均疊加 ATR 止損 / ATR 止盈保護
     """
     # ── 載入所有時框 ─────────────────────────────────────
     dfs = {}
@@ -836,12 +841,45 @@ def run_cascade_backtest(symbol: str, atr_sl: float = 1.5,
             tp   = entry_price + atr_tp * atr_30m
 
             reason = exit_price = None
+
+            # ATR 止損（所有模式共用）
             if cur <= sl:
-                reason, exit_price = "止損",    max(sl, cur)
+                reason, exit_price = "止損", max(sl, cur)
+            # ATR 止盈（所有模式共用）
             elif cur >= tp:
-                reason, exit_price = "止盈",    min(tp, cur)
-            elif bars_held >= hold_bars:
-                reason, exit_price = "到期平倉", cur
+                reason, exit_price = "止盈", min(tp, cur)
+            # ── 出場模式 ──────────────────────────────────
+            elif exit_mode == "固定根數":
+                if bars_held >= hold_bars:
+                    reason, exit_price = "固定根數平倉", cur
+
+            elif exit_mode == "30m轉負":
+                # 30m Histogram 從正轉負時出場
+                h30_cur  = h30_arr[i]
+                h30_prev_e = h30_arr[i-1] if i > 0 else h30_cur
+                if h30_prev_e >= 0 and h30_cur < 0:
+                    reason, exit_price = "30m轉負出場", cur
+                # 保底：超過 hold_bars*3 根未出場則強制平倉
+                elif bars_held >= hold_bars * 3:
+                    reason, exit_price = "保底平倉", cur
+
+            elif exit_mode == "1d/1h轉負":
+                # 1d 或 1h Histogram 轉負時出場
+                h1h_cur = h1h_arr[i]
+                h1h_prv = h1h_arr[i-1] if i > 0 else h1h_cur
+                h1d_cur = h1d_arr[i]
+                h1d_prv = h1d_arr[i-1] if i > 0 else h1d_cur
+                h1h_neg = (not np.isnan(h1h_cur) and not np.isnan(h1h_prv)
+                           and h1h_prv >= 0 and h1h_cur < 0)
+                h1d_neg = (not np.isnan(h1d_cur) and not np.isnan(h1d_prv)
+                           and h1d_prv >= 0 and h1d_cur < 0)
+                if h1h_neg:
+                    reason, exit_price = "1h轉負出場", cur
+                elif h1d_neg:
+                    reason, exit_price = "1d轉負出場", cur
+                # 保底：超過 hold_bars*5 根未出場則強制平倉
+                elif bars_held >= hold_bars * 5:
+                    reason, exit_price = "保底平倉", cur
 
             if reason:
                 pnl = (exit_price - entry_price) / entry_price * 100
@@ -1339,7 +1377,7 @@ Step 3 &nbsp;→&nbsp; 30m Histogram 前根 &lt; 0 → 當根 ≥ 0 &nbsp;（實
 st.markdown("---")
 
 # ── 回測參數設定 ──────────────────────────────────────────────
-bc1, bc2, bc3 = st.columns(3)
+bc1, bc2, bc3, bc4 = st.columns(4)
 with bc1:
     bt_symbols = st.multiselect(
         "回測股票",
@@ -1347,19 +1385,57 @@ with bc1:
         default=symbols[:1] if symbols else ["TSLA"],
     )
 with bc2:
-    bt_hold   = st.slider("持倉根數（30m K 線）", 3, 24, 6)
-    bt_atr_sl = st.slider("止損 (×ATR)", 0.5, 3.0, 1.5, 0.5)
+    bt_exit_mode = st.radio(
+        "📤 出場模式",
+        ["固定根數", "30m轉負", "1d/1h轉負"],
+        index=0,
+        help=(
+            "固定根數：持倉滿 N 根 30m K 線後平倉\n"
+            "30m轉負：30m Histogram 再次轉負時出場\n"
+            "1d/1h轉負：1h 或 1d Histogram 轉負時出場（跟隨大趨勢）"
+        ),
+    )
+    bt_hold = st.slider(
+        "固定根數（30m K線）" if bt_exit_mode == "固定根數" else "保底根數倍率參考",
+        3, 48, 6,
+        disabled=(bt_exit_mode != "固定根數"),
+        help="固定根數模式：持倉 N 根後平倉\n動態模式：作為保底上限倍率的基礎",
+    )
 with bc3:
-    bt_atr_tp = st.slider("止盈 (×ATR)", 1.0, 6.0, 3.0, 0.5)
-    run_bt    = st.button("🚀 開始回測", type="primary", use_container_width=True)
+    bt_atr_sl = st.slider("止損 (×ATR 30m)", 0.5, 3.0, 1.5, 0.5)
+    bt_atr_tp = st.slider("止盈 (×ATR 30m)", 1.0, 6.0, 3.0, 0.5)
+with bc4:
+    st.markdown("**出場模式說明**")
+    if bt_exit_mode == "固定根數":
+        _md_title = "🕐 固定根數"
+        _md_info  = f"持倉 <b>{bt_hold}</b> 根 30m K線 ≈ {bt_hold//2}小時<br>止損/盈：30m ATR<br><br>適合：短線、震盪市"
+    elif bt_exit_mode == "30m轉負":
+        _md_title = "🔄 30m 轉負出場"
+        _md_info  = "30m Histogram 正→負 時出場<br>止損/盈：30m ATR<br><br>適合：日內趨勢跟蹤"
+    else:
+        _md_title = "📅 1d/1h 轉負出場"
+        _md_info  = "1h 或 1d Histogram 轉負時出場<br>止損/盈：30m ATR<br><br>適合：波段持倉數天"
+    st.markdown(
+        '<div class="metric-card" style="font-size:11px;line-height:1.9;">'
+        + '<div class="label">' + _md_title + '</div>'
+        + '<div style="margin-top:8px;">' + _md_info + '</div></div>',
+        unsafe_allow_html=True,
+    )
+    run_bt = st.button("🚀 開始回測", type="primary", use_container_width=True)
 
 if run_bt and bt_symbols:
     for bt_sym in bt_symbols:
-        st.markdown(f"## 📈 {bt_sym}  —  最近60天 三步瀑布回測")
+        mode_label = {
+            "固定根數":  f"固定 {bt_hold} 根 30m",
+            "30m轉負":   "30m Histogram 轉負",
+            "1d/1h轉負": "1d/1h Histogram 轉負",
+        }[bt_exit_mode]
+        st.markdown(f"## 📈 {bt_sym}  —  最近60天 · 出場：{mode_label}")
 
         with st.spinner(f"載入 {bt_sym} 多時框數據並計算..."):
             result = run_cascade_backtest(
-                bt_sym, atr_sl=bt_atr_sl, atr_tp=bt_atr_tp, hold_bars=bt_hold
+                bt_sym, atr_sl=bt_atr_sl, atr_tp=bt_atr_tp,
+                hold_bars=bt_hold, exit_mode=bt_exit_mode,
             )
 
         # 錯誤處理
