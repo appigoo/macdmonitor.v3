@@ -651,6 +651,12 @@ def get_d1_series(df: pd.DataFrame) -> pd.Series:
     return d1_vals, hist
 
 
+def _latest_before(series: pd.Series, t) -> float:
+    """取時間點 t 之前（含）最新的有效值，用於跨時框對齊"""
+    sub = series[series.index <= t].dropna()
+    return float(sub.iloc[-1]) if len(sub) > 0 else np.nan
+
+
 def align_to_30m(df_30m: pd.DataFrame,
                  df_5m:  pd.DataFrame,
                  df_15m: pd.DataFrame,
@@ -658,46 +664,37 @@ def align_to_30m(df_30m: pd.DataFrame,
                  df_1d:  pd.DataFrame) -> pd.DataFrame:
     """
     以 30m K 線為基準時間軸，對齊各時框最新狀態。
-    每根 30m K 線結束時，查詢當時各時框的最新值。
+    每根 30m K 線結束時，查詢當時各時框的最新值（無未來偷看）。
     """
     # 計算各時框的 D+1 預測序列 和 Histogram 序列
+    # get_d1_series 回傳 (d1_series, hist_series)
     d1_5m,  hist_5m  = get_d1_series(df_5m)
     d1_15m, hist_15m = get_d1_series(df_15m)
     d1_30m, hist_30m = get_d1_series(df_30m)
     d1_1h,  hist_1h  = get_d1_series(df_1h)
-    _,      hist_1d  = calc_macd(df_1d["Close"])
-    _,      hist_1d  = calc_macd(df_1d["Close"])
-    _, sig_1d, hist_1d = calc_macd(df_1d["Close"])
+    # 1d 只需要 Histogram（不需要 D+1 預測），calc_macd 回傳3個值
+    _, _, hist_1d = calc_macd(df_1d["Close"])
 
     rows = []
     for i in range(10, len(df_30m)):
         t30 = df_30m.index[i]   # 當前 30m K 線結束時間
 
-        def latest_before(series: pd.Series, t) -> float:
-            """取 t 時間點之前（含）最新的有效值"""
-            sub = series[series.index <= t].dropna()
-            return sub.iloc[-1] if len(sub) > 0 else np.nan
+        # 30m 本身（直接用 index，不需要 latest_before）
+        h30   = float(hist_30m.iloc[i])
+        d1_30 = float(d1_30m.iloc[i]) if not pd.isna(d1_30m.iloc[i]) else np.nan
 
-        # 30m 本身
-        h30   = hist_30m.iloc[i]
-        d1_30 = d1_30m.iloc[i]
-
-        # 5m：t30 之前最新值
-        h5    = latest_before(hist_5m,  t30)
-        d5    = latest_before(d1_5m,    t30)
-
-        # 15m
-        h15   = latest_before(hist_15m, t30)
-        d15   = latest_before(d1_15m,   t30)
-
-        # 1h
-        h1h   = latest_before(hist_1h,  t30)
-        d1h   = latest_before(d1_1h,    t30)
+        # 5m / 15m / 1h：t30 之前最新值
+        h5    = _latest_before(hist_5m,  t30)
+        d5    = _latest_before(d1_5m,    t30)
+        h15   = _latest_before(hist_15m, t30)
+        d15   = _latest_before(d1_15m,   t30)
+        h1h   = _latest_before(hist_1h,  t30)
+        d1h   = _latest_before(d1_1h,    t30)
 
         # 1d：取 t30 日期當天或之前最新日線
-        t30_date = t30.date() if hasattr(t30, 'date') else pd.Timestamp(t30).date()
+        t30_date = pd.Timestamp(t30).date()
         sub_1d   = hist_1d[pd.to_datetime(hist_1d.index).date <= t30_date]
-        h1d      = sub_1d.iloc[-1] if len(sub_1d) > 0 else np.nan
+        h1d      = float(sub_1d.iloc[-1]) if len(sub_1d) > 0 else np.nan
 
         rows.append({
             "time":  t30,
