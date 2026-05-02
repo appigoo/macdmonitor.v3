@@ -1267,7 +1267,7 @@ for symbol in symbols:
                 st.info(f"👀 {atype}｜{trigger_tf} 空頭動能縮減，持續觀察傳導鏈")
 
         # ── 傳導鏈總覽圖 ────────────────────────────────────
-        st.plotly_chart(build_cascade_chart(cascade), use_container_width=True)
+        st.plotly_chart(build_cascade_chart(cascade), use_container_width=True, key=f"cascade_{symbol}_{id(cascade)}")
 
         # ── 傳導鏈各時框卡片 ────────────────────────────────
         valid_c = [r for r in cascade if r.get("valid")]
@@ -1336,7 +1336,7 @@ for symbol in symbols:
         fig = build_macd_chart(cdf, symbol,
                                 macd_s.tail(60), sig_s.tail(60), hist_s.tail(60),
                                 interval=tf_cfg["interval"])
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=f"macd_chart_{symbol}")
 
     # ── Telegram 信號 ─────────────────────────────────────────
     tg_msg = build_tg_msg(symbol, cascade, resonance,
@@ -1497,12 +1497,12 @@ if run_bt and bt_symbols:
         橙色虛線 = D+1預測（翻正即觸發Step2）
         </div>""", unsafe_allow_html=True)
         fig_entry = build_bt_entry_chart(result["aligned"], result["trades"])
-        st.plotly_chart(fig_entry, use_container_width=True)
+        st.plotly_chart(fig_entry, use_container_width=True, key=f"bt_entry_{bt_sym}")
 
         # ── 副圖：權益曲線 ────────────────────────────────
         st.markdown("##### 📉 累計收益曲線")
         fig_eq = build_equity_curve(result["trades"])
-        st.plotly_chart(fig_eq, use_container_width=True)
+        st.plotly_chart(fig_eq, use_container_width=True, key=f"bt_eq_{bt_sym}")
 
         # ── 出場原因分析 ──────────────────────────────────
         col_pie, col_reason, col_extreme = st.columns(3)
@@ -1522,7 +1522,7 @@ if run_bt and bt_symbols:
                 font=dict(family="IBM Plex Mono", size=11),
                 margin=dict(l=0,r=0,t=10,b=0), height=220, showlegend=False,
             )
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(fig_pie, use_container_width=True, key=f"bt_pie_{bt_sym}")
 
         with col_reason:
             st.markdown("##### 各出場方式勝率")
