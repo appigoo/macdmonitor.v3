@@ -1185,28 +1185,21 @@ with st.sidebar:
     st.caption(f"更新：{datetime.now().strftime('%H:%M:%S')}")
 
 if auto_refresh:
-    import time as _time
-    _now  = _time.time()
-    # 用 session_state 記錄上次刷新時間
-    _last_refresh = st.session_state.get("_last_page_refresh", 0)
-    _elapsed      = _now - _last_refresh
-    _remaining    = max(0, refresh_interval - _elapsed)
-
-    if _elapsed >= refresh_interval:
-        # 時間到：清除所有數據快取，強制重新拉取
+    from streamlit_autorefresh import st_autorefresh
+    # st_autorefresh 用 React component 定時觸發 st.rerun()
+    # 每次 rerun 前自動清除數據快取，確保數據一定更新
+    _count = st_autorefresh(
+        interval=refresh_interval * 1000,  # 毫秒
+        limit=None,                         # 無限次
+        key="autorefresh_timer",
+    )
+    if _count > 0:
+        # 每次 autorefresh 觸發時清除數據快取
         _keys_expired = [k for k in st.session_state.keys()
                          if k.startswith(("df_","ts_"))]
         for _k in _keys_expired:
             del st.session_state[_k]
-        st.session_state["_last_page_refresh"] = _now
-        st.rerun()
-    else:
-        # 未到時間：用 JS 在剩餘秒數後觸發 rerun
-        _remaining_int = int(_remaining) + 1
-        st.markdown(f"""<script>
-        setTimeout(function(){{window.location.reload();}},{_remaining_int*1000});
-        </script>""", unsafe_allow_html=True)
-        st.info(f"⏱ 每 {refresh_interval} 秒更新 · 下次更新 {int(_remaining)+1} 秒後")
+    st.info(f"⏱ 每 {refresh_interval} 秒自動更新 · 已刷新 {_count} 次")
 
 
 # ══════════════════════════════════════════════════════════════
