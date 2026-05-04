@@ -280,8 +280,23 @@ def pc(v):
 # ══════════════════════════════════════════════════════════════
 # 資料獲取
 # ══════════════════════════════════════════════════════════════
-@st.cache_data(ttl=60)
 def fetch_data(symbol, period, interval):
+    """
+    動態快取版本：
+    - 快取 key = (symbol, period, interval, 當前時間戳 // refresh_interval)
+    - 每隔 refresh_interval 秒自動過期，強制重新拉取最新數據
+    - 若未啟用自動刷新，則固定用 60 秒 TTL
+    """
+    # 取得目前刷新間隔設定（已在 sidebar 寫入 session_state）
+    ttl = st.session_state.get("refresh_interval", 60)
+    # 用時間槽作為快取 key，時間槽改變 → 自動取新數據
+    import time
+    slot = int(time.time()) // ttl
+    return _fetch_data_cached(symbol, period, interval, slot)
+
+@st.cache_data(ttl=600)
+def _fetch_data_cached(symbol, period, interval, time_slot):
+    """實際拉取數據，time_slot 參數確保每個時間槽只拉一次"""
     try:
         df = yf.Ticker(symbol).history(period=period, interval=interval)
         if df.empty: return pd.DataFrame()
@@ -1135,6 +1150,8 @@ with st.sidebar:
     st.markdown("**⏱ 自動刷新**")
     auto_refresh     = st.checkbox("啟用", value=False)
     refresh_interval = st.selectbox("間隔（秒）", [60,120,180,300], index=0)
+    # 存入 session_state 供 fetch_data 動態快取使用
+    st.session_state["refresh_interval"] = refresh_interval
 
     st.markdown("---")
     st.markdown("**📡 Telegram**")
@@ -1146,22 +1163,33 @@ with st.sidebar:
     st.caption(f"更新：{datetime.now().strftime('%H:%M:%S')}")
 
 if auto_refresh:
+    import time as _time
+    _now        = int(_time.time())
+    _slot_start = (_now // refresh_interval) * refresh_interval
+    _next       = _slot_start + refresh_interval
+    _remaining  = _next - _now
     st.markdown(f"""<script>
-    setTimeout(function(){{window.location.reload();}},{refresh_interval*1000});
+    setTimeout(function(){{window.location.reload();}},{_remaining*1000});
     </script>""", unsafe_allow_html=True)
-    st.info(f"⏱ 每 {refresh_interval} 秒自動刷新")
+    st.info(f"⏱ 每 {refresh_interval} 秒刷新 · 下次更新 {_remaining} 秒後 · 數據同步更新")
 
 
 # ══════════════════════════════════════════════════════════════
 # 主頁面
 # ══════════════════════════════════════════════════════════════
 st.markdown("# 🌊 MACD 瀑布動能傳導系統")
+import time as _time_main
+_ttl_now = st.session_state.get("refresh_interval", 60)
+_slot_ts = (int(_time_main.time()) // _ttl_now) * _ttl_now
+_data_ts = datetime.fromtimestamp(_slot_ts).strftime("%H:%M:%S")
 chain_str   = "  →  ".join(chain_tfs) if chain_tfs else "未設定"
 confirm_str = ", ".join(confirm_tfs)  if confirm_tfs else "—"
 st.markdown(f"""
 <div style="font-size:12px;color:#888;font-family:'IBM Plex Mono',monospace;margin-bottom:4px;">
 傳導鏈：{chain_str} &nbsp;|&nbsp; 觸發：<b style="color:#f0a500">{trigger_tf}</b>
 &nbsp;|&nbsp; 確認：{confirm_str}
+&nbsp;|&nbsp; 📡 數據批次：<b style="color:#3d8b5e">{_data_ts}</b>
+&nbsp;{"&nbsp;|&nbsp; ⏱ 每 " + str(_ttl_now) + " 秒更新" if auto_refresh else ""}
 </div>
 """, unsafe_allow_html=True)
 st.markdown("---")
