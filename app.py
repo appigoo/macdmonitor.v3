@@ -282,27 +282,34 @@ def pc(v):
 # ══════════════════════════════════════════════════════════════
 def fetch_data(symbol, period, interval):
     """
-    動態快取版本：
-    - 快取 key = (symbol, period, interval, 當前時間戳 // refresh_interval)
-    - 每隔 refresh_interval 秒自動過期，強制重新拉取最新數據
-    - 若未啟用自動刷新，則固定用 60 秒 TTL
+    Session-state 快取版本：
+    - 每次頁面載入檢查快取是否過期
+    - 過期（超過 refresh_interval 秒）→ 清除快取，重新拉取
+    - 未過期 → 直接返回 session_state 中的 DataFrame
+    - 完全不依賴 st.cache_data，確保自動刷新時數據一定更新
     """
-    # 取得目前刷新間隔設定（已在 sidebar 寫入 session_state）
-    ttl = st.session_state.get("refresh_interval", 60)
-    # 用時間槽作為快取 key，時間槽改變 → 自動取新數據
-    import time
-    slot = int(time.time()) // ttl
-    return _fetch_data_cached(symbol, period, interval, slot)
+    import time as _t
+    ttl      = st.session_state.get("refresh_interval", 60)
+    cache_key = f"df_{symbol}_{period}_{interval}"
+    ts_key    = f"ts_{symbol}_{period}_{interval}"
+    now       = _t.time()
 
-@st.cache_data(ttl=600)
-def _fetch_data_cached(symbol, period, interval, time_slot):
-    """實際拉取數據，time_slot 參數確保每個時間槽只拉一次"""
-    try:
-        df = yf.Ticker(symbol).history(period=period, interval=interval)
-        if df.empty: return pd.DataFrame()
-        return df[["Open","High","Low","Close","Volume"]].dropna()
-    except:
-        return pd.DataFrame()
+    # 檢查是否需要更新
+    last_fetch = st.session_state.get(ts_key, 0)
+    if now - last_fetch >= ttl or cache_key not in st.session_state:
+        # 過期或從未拉取 → 重新取數據
+        try:
+            df = yf.Ticker(symbol).history(period=period, interval=interval)
+            if df.empty:
+                df = pd.DataFrame()
+            else:
+                df = df[["Open","High","Low","Close","Volume"]].dropna()
+        except:
+            df = pd.DataFrame()
+        st.session_state[cache_key] = df
+        st.session_state[ts_key]    = now
+
+    return st.session_state[cache_key]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -637,19 +644,26 @@ BT_INTRADAY_CONFIGS = {
 }
 
 
-@st.cache_data(ttl=300)
 def fetch_bt_tf(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    try:
-        df = yf.Ticker(symbol).history(period=period, interval=interval)
-        if df.empty:
-            return pd.DataFrame()
-        df = df[["Open","High","Low","Close","Volume"]].dropna()
-        # 統一轉為 America/New_York 時區，移除 tz 方便對齊
-        if df.index.tz is not None:
-            df.index = df.index.tz_convert("America/New_York").tz_localize(None)
-        return df
-    except:
-        return pd.DataFrame()
+    """回測數據：session_state 快取，TTL = 300 秒（回測不需要即時數據）"""
+    import time as _t
+    cache_key = f"bt_{symbol}_{period}_{interval}"
+    ts_key    = f"bt_ts_{symbol}_{period}_{interval}"
+    now       = _t.time()
+    if now - st.session_state.get(ts_key, 0) >= 300 or cache_key not in st.session_state:
+        try:
+            df = yf.Ticker(symbol).history(period=period, interval=interval)
+            if df.empty:
+                df = pd.DataFrame()
+            else:
+                df = df[["Open","High","Low","Close","Volume"]].dropna()
+                if df.index.tz is not None:
+                    df.index = df.index.tz_convert("America/New_York").tz_localize(None)
+        except:
+            df = pd.DataFrame()
+        st.session_state[cache_key] = df
+        st.session_state[ts_key]    = now
+    return st.session_state[cache_key]
 
 
 def get_d1_series(df: pd.DataFrame) -> pd.Series:
@@ -1160,6 +1174,14 @@ with st.sidebar:
     tg_send  = st.button("📤 發送所有信號")
 
     st.markdown("---")
+    if st.button("🔄 立即清除快取", help="強制清除所有數據快取，下次載入重新拉取"):
+        # 清除所有 df_ 和 ts_ 開頭的 session_state key
+        keys_to_del = [k for k in st.session_state.keys()
+                       if k.startswith(("df_","ts_","bt_","bt_ts_"))]
+        for k in keys_to_del:
+            del st.session_state[k]
+        st.success(f"✅ 已清除 {len(keys_to_del)} 個快取")
+        st.rerun()
     st.caption(f"更新：{datetime.now().strftime('%H:%M:%S')}")
 
 if auto_refresh:
