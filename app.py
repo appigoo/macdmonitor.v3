@@ -762,9 +762,27 @@ def render_table(df_t):
 # ── v2.4 排序比較 + 深度分析 Prompt 產生器 ──────────────────────
 _LEVEL_RANK = {"red": 2, "yellow": 1, None: 0}
 
+def leaning(r):
+    """未達警報門檻時的潛在傾向：比較底層多/空分數（非正式訊號，僅供排序參考）"""
+    bp, sp = r.get("bull_pts", 0), r.get("bear_pts", 0)
+    if bp == 0 and sp == 0:
+        return None
+    return "bear" if sp >= bp else "bull"
+
 def rank_key(r):
-    """排序鍵：等級 > 評分 > |星級共振| 。等級/分數相同時空頭優先（風險優先顯示）。"""
-    return (_LEVEL_RANK.get(r["level"], 0), r["pts"], 0 if r["direction"]=="bear" else -1)
+    """
+    排序鍵（由粗到細）：
+      1. 正式警報等級（紅>橙>無）
+      2. 正式警報分數
+      3. 底層潛在傾向分（即使未觸發警報，分數越高代表方向性越強）
+         → 這一層修正「大時框很少翻轉 → 全部靜默 → 排序退化成輸入順序」的問題
+      4. 同分時空頭優先（風險優先顯示）
+    """
+    lvl     = _LEVEL_RANK.get(r["level"], 0)
+    pts     = r["pts"]
+    sub     = max(r.get("bull_pts", 0), r.get("bear_pts", 0))
+    eff_dir = r["direction"] or leaning(r)
+    return (lvl, pts, sub, 1 if eff_dir == "bear" else 0)
 
 def build_analysis_prompt(rank_data, main_tf, trigger_tf):
     """
@@ -788,16 +806,27 @@ def build_analysis_prompt(rank_data, main_tf, trigger_tf):
     L.append("3. 指出技術面看似強烈、但基本面有潛在風險的標的（反之亦然）")
     L.append("4. 給出這批股票的優先順序建議（若只能選 1–2 支操作）")
     L.append("")
-    L.append("## 排行結果（依警報等級與評分排序）")
+    L.append("## 排行結果（依警報等級與評分排序；無正式警報時退回「潛在傾向分」排序）")
+    all_silent = all(r["pts"] == 0 for r in ranked)
+    if all_silent:
+        L.append("")
+        L.append("⚠️ 注意：這批標的目前都沒有觸發正式警報（大時框較少翻轉是正常現象），"
+                  "下表的「方向/評分」是尚未達門檻的潛在傾向分，僅供參考，"
+                  "請勿當作已確認的技術訊號來解讀。")
     L.append("")
     L.append("| 排名 | 代碼 | 方向 | 等級 | 評分 | 收盤 | ATR% | 趨勢 | RVOL | VWAP位置 |")
     L.append("|---|---|---|---|---|---|---|---|---|---|")
     for i, r in enumerate(ranked, 1):
-        dirn  = {"bear":"🔴空頭","bull":"🟢多頭",None:"—"}.get(r["direction"],"—")
+        eff_dir = r["direction"] or leaning(r)
+        sub     = max(r.get("bull_pts", 0), r.get("bear_pts", 0))
+        dirn  = {"bear":"🔴空頭","bull":"🟢多頭",None:"⚪中性"}.get(eff_dir,"⚪中性")
+        if not r["direction"] and eff_dir:
+            dirn += "(潛在)"
         lvl   = {"red":"紅色警報","yellow":"橙色觀察",None:"靜默"}.get(r["level"],"靜默")
+        score_disp = r["pts"] if r["pts"] else f"潛在{sub}"
         rvol  = f"{r['rvol']:.2f}×" if r.get("rvol") is not None else "—"
         vwapp = ("下方" if r.get("below_vwap") else "上方") if r.get("below_vwap") is not None else "—"
-        L.append(f"| {i} | {r['symbol']} | {dirn} | {lvl} | {r['pts']} | "
+        L.append(f"| {i} | {r['symbol']} | {dirn} | {lvl} | {score_disp} | "
                   f"{r['close']:.2f} | {r['atr_pct']:.2f}% | {r['trend']} | {rvol} | {vwapp} |")
 
     L.append("")
@@ -1853,6 +1882,7 @@ for symbol in symbols:
             "trend": trend,
             "alert": resonance["alert"], "direction": resonance.get("direction"),
             "level": resonance.get("level"), "pts": resonance.get("pts", 0),
+            "bull_pts": resonance.get("bull_pts", 0), "bear_pts": resonance.get("bear_pts", 0),
             "atype": resonance.get("atype"),
             "score": resonance["score"], "max": resonance["max"],
             "detail": resonance.get("detail", []),
@@ -1892,15 +1922,27 @@ if rank_data:
     ranked = sorted(rank_data, key=rank_key, reverse=True)
     disp_rows = []
     for i, r in enumerate(ranked, 1):
-        dirn = {"bear":"🔴 空頭","bull":"🟢 多頭",None:"—"}.get(r["direction"],"—")
+        eff_dir = r["direction"] or leaning(r)
+        sub     = max(r.get("bull_pts", 0), r.get("bear_pts", 0))
+        if r["direction"]:
+            dirn = {"bear":"🔴 空頭","bull":"🟢 多頭"}[r["direction"]]
+        elif eff_dir:
+            dirn = {"bear":f"🔴 偏空（未達門檻，潛在 {sub} 分）",
+                    "bull":f"🟢 偏多（未達門檻，潛在 {sub} 分）"}[eff_dir]
+        else:
+            dirn = "⚪ 中性"
         lvl  = {"red":"🔴 紅色警報","yellow":"🟠 橙色觀察",None:"⚪ 靜默"}.get(r["level"],"⚪ 靜默")
         disp_rows.append({
             "排名": i, "代碼": r["symbol"], "方向": dirn, "等級": lvl,
-            "評分": r["pts"], "收盤": round(r["close"],2),
-            "ATR%": round(r["atr_pct"],2), "趨勢": r["trend"],
+            "評分": r["pts"] if r["pts"] else f"(潛在{sub})",
+            "收盤": f"{r['close']:.2f}",
+            "ATR%": f"{r['atr_pct']:.2f}%", "趨勢": r["trend"],
             "RVOL": f"{r['rvol']:.2f}×" if r.get("rvol") is not None else "—",
         })
     st.dataframe(pd.DataFrame(disp_rows), hide_index=True, use_container_width=True)
+    if all(r["pts"] == 0 for r in rank_data):
+        st.caption("⚠️ 這批標的目前都沒有正式警報（大時框本來就少見翻轉屬正常），"
+                   "排序改用「潛在傾向分」——僅供參考，不代表已觸發訊號。")
 
     st.markdown("#### 📋 最佳股票分析 Prompt · 複製後貼入任意 AI 進行深度分析")
     st.caption("本系統只做技術面 + 量能的程式化判定；把下方內容貼給 ChatGPT / Claude / "
