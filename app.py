@@ -17,6 +17,29 @@
 ║     確認時框(1d/1h) Histogram > 0  ← 大方向多頭              ║
 ║     觸發時框(30m)  當前 Hist < 0   ← 尚未入場                ║
 ║     觸發時框(30m)  D+1 預測 > 0    ← 預計翻正 → 預警         ║
+║                                                              ║
+║  ── v2.1 新增（2026-07-03，因應 07-02 TSLA 暴跌）──          ║
+║  5. 空頭側對稱警報：                                         ║
+║     a) Hist > 0 且 D+1 < 0        → 預警：預測翻負           ║
+║     b) 前根 ≥ 0 → 當根 < 0        → 警報：實際翻負           ║
+║     c) Hist < 0 且 D+1 < Hist                                 ║
+║        且大時框半數同向轉空       → 警報：瀑布下行           ║
+║  6. 「接近反轉」閾值改用 Hist 滾動σ歸一化（0.15σ）           ║
+║  7. Telegram 警報自動推送（MD5 去重，每訊號每小時一次）      ║
+║  8. 空頭警報：紅色橫幅 + 反向 ATR 止損/目標                  ║
+║                                                              ║
+║  ── v2.2/v2.3 新增（量能整合 + 計分制 + 交易建議）──         ║
+║  9. RVOL 相對量能：日內用「過去10天同時段」基準，            ║
+║     解決日內 U 形量能造成的開盤誤報                          ║
+║  10. VWAP 當日錨定：價格在 VWAP 上/下方作方向確認            ║
+║  11. 開盤缺口偵測：跳空 ≥1.5% 直接高分警報                   ║
+║  12. 計分制警報（多空對稱）：                                ║
+║      翻轉 +2｜D+1 預測翻轉 +1｜加速>1.5σ +2                  ║
+║      RVOL ≥2.5 +3｜1.5–2.5 +1｜<0.8 −2（記到陰/陽方向）     ║
+║      VWAP 方向 +1｜大時框同向每個 +1｜缺口 +3                ║
+║      ≥5 分 🔴 警報｜3–4 分 🟠 觀察｜<3 分靜默                ║
+║  13. 訊號判定一律用「已收盤」bar，杜絕未收盤 bar 重繪誤報    ║
+║  14. 時間戳修正為真正的美東時間；休市/非交易時段標註         ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -29,6 +52,8 @@ from plotly.subplots import make_subplots
 from datetime import datetime
 import requests
 import time
+import hashlib
+from zoneinfo import ZoneInfo
 
 # ══════════════════════════════════════════════════════════════
 # 頁面設定
@@ -121,6 +146,11 @@ h1,h2,h3 { font-family: 'IBM Plex Mono', monospace; color: #2c2c2c; }
     border:2px solid #f0c040; border-radius:12px;
     padding:16px 20px; margin:8px 0;
 }
+.alert-card-bear {
+    background:linear-gradient(135deg,#fff5f4,#fde8e8);
+    border:2px solid #c0392b; border-radius:12px;
+    padding:16px 20px; margin:8px 0;
+}
 .alert-body {
     font-size:13px; color:#444; line-height:2;
     font-family:'IBM Plex Mono',monospace;
@@ -182,6 +212,7 @@ STATUS_NEXT_DAY = {
     "接近反轉":      ("金叉概率提升","neu"),
     "多頭開始回補":  ("動能轉正",    "bull"),
     "Histogram翻正": ("短線突破",    "bull"),
+    "Histogram翻負": ("跌勢展開",    "bear"),
     "MACD金叉確認":  ("多頭加速",    "bull"),
     "多頭加速":      ("趨勢延續",    "bull"),
     "強勢多頭":      ("趨勢延續",    "bull"),
@@ -204,6 +235,36 @@ def calc_atr(df, period=14):
     tr = pd.concat([h-l, (h-cp).abs(), (l-cp).abs()], axis=1).max(axis=1)
     return tr.ewm(span=period, adjust=False).mean().iloc[-1]
 
+# ── v2.2 量能指標 ────────────────────────────────────────────
+INTRADAY_IVS = {"1m","5m","15m","30m","1h","60m","90m"}
+
+def calc_rvol(df):
+    """
+    RVOL（日內版）：當前 bar 成交量 ÷ 過去10天「同一時段」平均量。
+    日內量能天然呈 U 形（開盤/尾盤爆量、午盤清淡），
+    用同時段基準才不會在開盤時段永遠誤報放量。
+    """
+    try:
+        tod  = df.index.strftime("%H:%M")
+        base = df["Volume"].groupby(tod).transform(
+            lambda s: s.shift(1).rolling(10, min_periods=3).mean())
+        return df["Volume"] / base
+    except Exception:
+        return pd.Series(np.nan, index=df.index)
+
+def calc_rvol_simple(df, n=20):
+    """RVOL（日/週線版）：當前量 ÷ 前 n 根平均量"""
+    base = df["Volume"].shift(1).rolling(n, min_periods=5).mean()
+    return df["Volume"] / base
+
+def calc_vwap(df):
+    """當日錨定 VWAP（僅日內時框有意義）"""
+    tp  = (df["High"] + df["Low"] + df["Close"]) / 3
+    day = df.index.normalize()
+    cum_pv = (tp * df["Volume"]).groupby(day).cumsum()
+    cum_v  = df["Volume"].groupby(day).cumsum()
+    return cum_pv / cum_v.replace(0, np.nan)
+
 def predict_next3(hist):
     """
     D+1: 線性外推（延續當前動能斜率）
@@ -221,6 +282,9 @@ def predict_next3(hist):
 
 def classify_status(hist, macd, signal):
     out = []
+    # 反轉閾值用 Histogram 滾動標準差歸一化（取代固定 0.005，
+    # 否則 TSLA 5m 級別的 Hist 永遠不會命中「接近反轉」）
+    sig_roll = hist.rolling(40, min_periods=5).std()
     for i in range(len(hist)):
         h  = hist.iloc[i]
         hp = hist.iloc[i-1]  if i>0 else h
@@ -228,8 +292,11 @@ def classify_status(hist, macd, signal):
         s  = signal.iloc[i]
         mp = macd.iloc[i-1]  if i>0 else m
         sp = signal.iloc[i-1] if i>0 else s
-        if   abs(h) < 0.005:                      st = "接近反轉"
+        sg = sig_roll.iloc[i]
+        thr = max(0.005, 0.15 * sg) if pd.notna(sg) else 0.005
+        if   abs(h) < thr:                        st = "接近反轉"
         elif i>0 and hp<0 and h>=0:               st = "Histogram翻正"
+        elif i>0 and hp>=0 and h<0:               st = "Histogram翻負"
         elif i>0 and m>s and mp<=sp:              st = "MACD金叉確認"
         elif h>0 and m>0:                          st = "強勢多頭"
         elif h>0 and i>0 and h>hp:                st = "多頭加速"
@@ -256,7 +323,7 @@ def trend_pill(tr):
 def badge_html(st):
     if any(k in st for k in ["多頭","翻正","金叉","放緩"]):
         return f'<span class="badge badge-bull">▲ {st}</span>'
-    elif any(k in st for k in ["空頭","動能強"]):
+    elif any(k in st for k in ["空頭","動能強","翻負"]):
         return f'<span class="badge badge-bear">▼ {st}</span>'
     elif any(k in st for k in ["接近反轉","減弱"]):
         return f'<span class="badge badge-warn">◆ {st}</span>'
@@ -325,59 +392,201 @@ def analyze_cascade(symbol, chain):
         if df.empty or len(df) < 30:
             results.append({"tf":tf, "valid":False})
             continue
+        intraday = cfg["interval"] in INTRADAY_IVS
         macd, sig, hist = calc_macd(df["Close"])
         sts  = classify_status(hist, macd, sig)
-        hv   = hist.iloc[-1]
+        hv   = hist.iloc[-1]     # 最後一根（可能未收盤，僅顯示用）
         mv   = macd.iloc[-1]
         sv   = sts[-1]
-        d1,d2,d3 = predict_next3(hist)
+
+        # ── v2.2：訊號判定一律用「已收盤」bar，避免未收盤 bar 重繪 ──
+        hist_closed = hist.iloc[:-1] if len(hist) > 1 else hist
+        hc  = hist_closed.iloc[-1]
+        hcp = hist_closed.iloc[-2] if len(hist_closed) > 1 else hc
+        # D+1/D+2/D+3 由已收盤序列外推（= 對「當前形成中 bar」的預測，不重繪）
+        d1, d2, d3 = predict_next3(hist_closed)
+        sigma = hist_closed.iloc[-40:].std() if len(hist_closed) >= 10 else max(abs(hc), 1e-9)
+
+        # 動能加速（已收盤最後 3 根，>1.5σ 才算，過濾雜訊）
+        accel_dn = accel_up = False
+        if len(hist_closed) >= 3 and pd.notna(sigma) and sigma > 0:
+            h3 = hist_closed.iloc[-3:].values
+            accel_dn = bool(hc < 0 and h3[0] > h3[1] > h3[2] and (h3[0]-h3[2]) > 1.5*sigma)
+            accel_up = bool(hc > 0 and h3[0] < h3[1] < h3[2] and (h3[2]-h3[0]) > 1.5*sigma)
+
+        # ── 量能：RVOL（已收盤 bar）──
+        rv_series = calc_rvol(df) if intraday else calc_rvol_simple(df)
+        rvol = rv_series.iloc[-2] if len(rv_series) > 1 else np.nan
+
+        # ── VWAP（僅日內，已收盤 bar 位置）──
+        vwap_val, below_vwap = None, None
+        if intraday:
+            vw = calc_vwap(df)
+            if len(vw) > 1 and pd.notna(vw.iloc[-2]):
+                vwap_val   = float(vw.iloc[-2])
+                below_vwap = bool(df["Close"].iloc[-2] < vwap_val)
+
+        # ── 開盤缺口（僅日內且數據含前一交易日）──
+        gap_pct = None
+        if intraday:
+            days = df.index.normalize()
+            uday = days.unique()
+            if len(uday) >= 2:
+                prev_close = df["Close"][days == uday[-2]].iloc[-1]
+                gap_pct    = float(df["Open"][days == uday[-1]].iloc[0] / prev_close - 1)
+
+        bar_dn = bool(df["Close"].iloc[-2] < df["Open"].iloc[-2]) if len(df) > 1 else False
+
         results.append({
             "tf":tf, "valid":True,
             "hist":hv, "macd":mv, "status":sv,
-            "trend":get_trend(mv,hv,sv),
+            "hist_prev": hist.iloc[-2] if len(hist) > 1 else hv,
+            "hist_c":hc, "hist_c_prev":hcp,
             "d1":d1, "d2":d2, "d3":d3,
+            "sigma":sigma, "accel_dn":accel_dn, "accel_up":accel_up,
+            "rvol": float(rvol) if pd.notna(rvol) else None,
+            "vwap":vwap_val, "below_vwap":below_vwap,
+            "gap_pct":gap_pct, "bar_dn":bar_dn,
+            "last_bar_day": str(df.index[-1].date()),
+            "trend":get_trend(mv,hv,sv),
             "atr":calc_atr(df),
             "close":df["Close"].iloc[-1],
         })
     return results
 
 
+ALERT_RED    = 5   # >= 5 分 → 紅色警報（立即行動級）
+ALERT_YELLOW = 3   # 3–4 分  → 橙色觀察（提高注意）
+
 def calc_resonance(cascade, confirm_tfs, trigger_tf):
     """
-    共振評分：
-    - 確認時框（大時框）Histogram > 0 各得 1 分
-    - 觸發時框當前 < 0 且 D+1 > 0 → 進場預警 + 加 1 分
-    - 觸發時框當前 < 0 且 D+1 < 0 但縮小 → 觀察信號
+    v2.2 計分制警報引擎（多空完全對稱，全部用已收盤 bar 判定）：
+
+      事件分：
+        Histogram 翻轉          +2
+        D+1 預測翻轉            +1
+        動能加速（3根遞減>1.5σ） +2
+        開盤缺口 |gap| >= 1.5%   +3
+        大時框同向               每個 +1
+      量能分（記到已收盤 K 線的陰/陽方向）：
+        RVOL >= 2.5  +3（機構級）
+        RVOL 1.5–2.5 +1（顯著放量）
+        RVOL <  0.8  −2（縮量 → 大概率洗盤，壓制警報）
+      位置分：
+        價格 < VWAP → 空方 +1；價格 > VWAP → 多方 +1
+
+      判定：事件錨定 — 必須至少有一個「事件分」訊號才能構成警報，
+        同向/量能/VWAP 分只能加成、不能單獨發起（防止全天亂響）；
+        取多/空較高分方向（同分空方優先＝風險優先）
+        >= 5 分 → 紅色警報（推送）
+        3–4 分 → 橙色觀察（推送）
+        <  3 分 → 靜默
     """
     valid = [r for r in cascade if r.get("valid")]
-    confirm_score, confirm_max = 0, 0
-
+    confirm_score, bear_score, confirm_max = 0, 0, 0
     for r in valid:
         if r["tf"] in confirm_tfs:
             confirm_max += 1
-            if r["hist"] > 0:
-                confirm_score += 1
+            h_ref = r.get("hist_c", r["hist"])
+            if   h_ref > 0: confirm_score += 1
+            elif h_ref < 0: bear_score    += 1
 
-    trig  = next((r for r in valid if r["tf"] == trigger_tf), None)
-    alert = False
-    atype = None
+    trig      = next((r for r in valid if r["tf"] == trigger_tf), None)
+    alert     = False
+    atype     = None
+    direction = None
+    level     = None
+    pts, detail = 0, []
+    bear_pts, bull_pts = 0, 0
+    bear_dt,  bull_dt  = [], []
 
     if trig:
-        h, d1 = trig["hist"], trig["d1"]
-        if h < 0 and d1 > 0 and confirm_score >= max(1, confirm_max * 0.5):
-            alert = True
-            atype = "預警：D+1 預測翻正，準備做多"
-        elif h < 0 and d1 < 0 and d1 > h:
-            alert = True
-            atype = "觀察：空頭動能減弱"
+        hc   = trig.get("hist_c", 0)
+        hcp  = trig.get("hist_c_prev", hc)
+        d1   = trig.get("d1", 0)
+        rvol = trig.get("rvol")
+        bvw  = trig.get("below_vwap")
+        gap  = trig.get("gap_pct")
 
-    total = confirm_score + (1 if alert and atype and "預警" in atype else 0)
+        # ── 空頭事件 ──────────────────────────────────────
+        bear_evt = bull_evt = False
+        if hcp >= 0 and hc < 0:
+            bear_pts += 2; bear_dt.append("Histogram 翻負 +2"); bear_evt = True
+        if hc > 0 and d1 < 0:
+            bear_pts += 1; bear_dt.append("D+1 預測翻負 +1"); bear_evt = True
+        if trig.get("accel_dn"):
+            bear_pts += 2; bear_dt.append("空頭加速 >1.5σ +2"); bear_evt = True
+        if gap is not None and gap <= -0.015:
+            bear_pts += 3; bear_dt.append(f"開盤缺口 {gap*100:+.1f}% +3"); bear_evt = True
+        if bear_score:
+            bear_pts += bear_score
+            bear_dt.append(f"大時框同向 ×{bear_score} +{bear_score}")
+
+        # ── 多頭事件（鏡像）──────────────────────────────
+        if hcp <= 0 and hc > 0:
+            bull_pts += 2; bull_dt.append("Histogram 翻正 +2"); bull_evt = True
+        if hc < 0 and d1 > 0:
+            bull_pts += 1; bull_dt.append("D+1 預測翻正 +1"); bull_evt = True
+        if trig.get("accel_up"):
+            bull_pts += 2; bull_dt.append("多頭加速 >1.5σ +2"); bull_evt = True
+        if gap is not None and gap >= 0.015:
+            bull_pts += 3; bull_dt.append(f"開盤缺口 {gap*100:+.1f}% +3"); bull_evt = True
+        if confirm_score:
+            bull_pts += confirm_score
+            bull_dt.append(f"大時框同向 ×{confirm_score} +{confirm_score}")
+
+        # ── 量能分（依已收盤 K 線陰陽記方向）─────────────
+        if rvol is not None and not np.isnan(rvol):
+            vp, vtxt = 0, None
+            if   rvol >= 2.5: vp, vtxt =  3, f"RVOL {rvol:.1f}× 機構級 +3"
+            elif rvol >= 1.5: vp, vtxt =  1, f"RVOL {rvol:.1f}× 放量 +1"
+            elif rvol <  0.8: vp, vtxt = -2, f"RVOL {rvol:.1f}× 縮量 −2"
+            if vtxt:
+                if trig.get("bar_dn"):
+                    bear_pts += vp; bear_dt.append(vtxt)
+                else:
+                    bull_pts += vp; bull_dt.append(vtxt)
+
+        # ── VWAP 位置分 ──────────────────────────────────
+        if bvw is True:
+            bear_pts += 1; bear_dt.append("價格 < VWAP +1")
+        elif bvw is False:
+            bull_pts += 1; bull_dt.append("價格 > VWAP +1")
+
+        # ── 判定（事件錨定：無觸發框事件則不構成警報，
+        #    同向分/量能分/VWAP分只能「加成」不能「發起」）──
+        cands = []
+        if bear_evt and bear_pts >= ALERT_YELLOW:
+            cands.append(("bear", bear_pts, bear_dt))
+        if bull_evt and bull_pts >= ALERT_YELLOW:
+            cands.append(("bull", bull_pts, bull_dt))
+        if cands:
+            # 同分時取列表首位 = 空方優先（風險優先原則）
+            direction, pts, detail = max(cands, key=lambda c: c[1])
+            alert = True
+            level = "red" if pts >= ALERT_RED else "yellow"
+            if direction == "bear":
+                atype = (f"警報：空頭 {pts} 分，建議減倉/離場" if level == "red"
+                         else f"觀察：空頭訊號累積 {pts} 分")
+            else:
+                atype = (f"預警：多頭 {pts} 分，準備做多" if level == "red"
+                         else f"觀察：多頭訊號累積 {pts} 分")
+
+    # 星級共振分（沿用原顯示邏輯，按警報方向計對齊數）
+    base  = bear_score if direction == "bear" else confirm_score
+    total = base + (1 if alert else 0)
     return {
-        "score":   total,
-        "max":     confirm_max + 1,
-        "alert":   alert,
-        "atype":   atype,
-        "trigger": trig,
+        "score":     total,
+        "max":       confirm_max + 1,
+        "alert":     alert,
+        "atype":     atype,
+        "direction": direction,
+        "level":     level,
+        "pts":       pts,
+        "bear_pts":  bear_pts,
+        "bull_pts":  bull_pts,
+        "detail":    detail,
+        "trigger":   trig,
     }
 
 
@@ -550,12 +759,157 @@ def render_table(df_t):
 # ══════════════════════════════════════════════════════════════
 # Telegram
 # ══════════════════════════════════════════════════════════════
-def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_price, atr_1d):
-    atype = resonance.get("atype","")
-    trig  = resonance.get("trigger") or {}
+# ── v2.4 排序比較 + 深度分析 Prompt 產生器 ──────────────────────
+_LEVEL_RANK = {"red": 2, "yellow": 1, None: 0}
 
-    if resonance["alert"] and "預警" in atype:
-        header = f"⚡ {symbol} 進場預警"
+def rank_key(r):
+    """排序鍵：等級 > 評分 > |星級共振| 。等級/分數相同時空頭優先（風險優先顯示）。"""
+    return (_LEVEL_RANK.get(r["level"], 0), r["pts"], 0 if r["direction"]=="bear" else -1)
+
+def build_analysis_prompt(rank_data, main_tf, trigger_tf):
+    """
+    產生可直接貼給任意 AI（ChatGPT / Claude / Gemini 等）的深度分析 Prompt。
+    本系統只做「技術面 + 量能」的程式化判定；Prompt 的用途是請另一個 AI
+    補上本系統做不到的部分：基本面、新聞事件、產業比較、情緒面交叉驗證。
+    """
+    if not rank_data:
+        return ""
+    ranked = sorted(rank_data, key=rank_key, reverse=True)
+    ny = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M ET")
+
+    L = []
+    L.append(f"# 股票技術面排行分析請求（數據時間：{ny}）")
+    L.append("")
+    L.append("以下是我用自建的 MACD 瀑布傳導 + RVOL/VWAP 量能計分系統，")
+    L.append(f"對多支股票在 {main_tf} 主時框、{trigger_tf} 觸發時框下跑出的技術面排行結果。")
+    L.append("請你在此技術面基礎上，補充做以下深度分析：")
+    L.append("1. 逐一檢查近期基本面／財報／新聞事件，是否與技術面訊號吻合或衝突")
+    L.append("2. 若有多支同向訊號，比較哪一支的風險報酬比最佳，並說明原因")
+    L.append("3. 指出技術面看似強烈、但基本面有潛在風險的標的（反之亦然）")
+    L.append("4. 給出這批股票的優先順序建議（若只能選 1–2 支操作）")
+    L.append("")
+    L.append("## 排行結果（依警報等級與評分排序）")
+    L.append("")
+    L.append("| 排名 | 代碼 | 方向 | 等級 | 評分 | 收盤 | ATR% | 趨勢 | RVOL | VWAP位置 |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|")
+    for i, r in enumerate(ranked, 1):
+        dirn  = {"bear":"🔴空頭","bull":"🟢多頭",None:"—"}.get(r["direction"],"—")
+        lvl   = {"red":"紅色警報","yellow":"橙色觀察",None:"靜默"}.get(r["level"],"靜默")
+        rvol  = f"{r['rvol']:.2f}×" if r.get("rvol") is not None else "—"
+        vwapp = ("下方" if r.get("below_vwap") else "上方") if r.get("below_vwap") is not None else "—"
+        L.append(f"| {i} | {r['symbol']} | {dirn} | {lvl} | {r['pts']} | "
+                  f"{r['close']:.2f} | {r['atr_pct']:.2f}% | {r['trend']} | {rvol} | {vwapp} |")
+
+    L.append("")
+    L.append("## 各標的技術細節")
+    for r in ranked:
+        L.append(f"\n### {r['symbol']}")
+        if r["atype"]:
+            L.append(f"- 判定：{r['atype']}")
+        if r.get("detail"):
+            L.append(f"- 評分依據：{'；'.join(r['detail'])}")
+        if r.get("gap_pct") is not None and abs(r["gap_pct"]) >= 0.003:
+            L.append(f"- 開盤缺口：{r['gap_pct']*100:+.2f}%")
+        casc = r.get("cascade") or []
+        if casc:
+            tf_line = "、".join(
+                f"{c['tf']}:{c['hist']:+.3f}(D+1 {c['d1']:+.3f})"
+                for c in casc if c.get("hist") is not None
+            )
+            L.append(f"- 各時框 Histogram：{tf_line}")
+
+    L.append("")
+    L.append("---")
+    L.append("以上數據為程式化技術指標計算結果，非投資建議；"
+              "請結合你查得到的最新公開資訊進行判斷。")
+    return "\n".join(L)
+
+
+def build_trade_plan(direction, level, pts, trig, style):
+    """
+    依警報方向/等級/風格產生交易建議。
+    激進：訊號 bar 即進場、1.0×ATR 緊止損、允許加倉、含持倉處置
+    穩健：等下一根收盤確認、1.5×ATR 止損
+    ATR 一律用「觸發時框」的 ATR（日內訊號配日內止損距離）。
+    """
+    if not trig or not trig.get("valid"):
+        return []
+    px = trig.get("close")
+    a  = trig.get("atr", 0)
+    if not px or not a or a <= 0:
+        return []
+    L = [f"\n【交易建議｜{style}】"]
+
+    if style == "激進":
+        if direction == "bear":
+            if level == "red":
+                L += [
+                    f"  空單進場  市價 {px:.2f}（訊號 bar 即進場，不等確認）",
+                    f"  止損      {px + 1.0*a:.2f}（+1.0×ATR 觸發時框）",
+                    f"  目標1     {px - 1.5*a:.2f}（-1.5×ATR，到手止損移保本）",
+                    f"  目標2     {px - 3.0*a:.2f}（-3.0×ATR，追蹤出場）",
+                    f"  倉位      首倉全額；評分 ≥7 可於反抽 VWAP 加倉一次",
+                    f"  持多倉    立即減半；跌破 VWAP 全部離場",
+                ]
+            else:
+                L += [
+                    f"  試探空單  ≤1/3 倉位 @ {px:.2f}",
+                    f"  止損      {px + 0.75*a:.2f}（+0.75×ATR 收緊）",
+                    f"  升級      評分升至 ≥5 補至全倉；退回 <3 分立即平倉",
+                ]
+        else:  # bull
+            if level == "red":
+                L += [
+                    f"  多單進場  市價 {px:.2f}（訊號 bar 即進場，不等確認）",
+                    f"  止損      {px - 1.0*a:.2f}（-1.0×ATR 觸發時框）",
+                    f"  目標1     {px + 1.5*a:.2f}（+1.5×ATR，到手止損移保本）",
+                    f"  目標2     {px + 3.0*a:.2f}（+3.0×ATR，追蹤出場）",
+                    f"  倉位      首倉全額；評分 ≥7 可於回踩 VWAP 加倉一次",
+                    f"  持空倉    立即減半；站回 VWAP 全部回補",
+                ]
+            else:
+                L += [
+                    f"  試探多單  ≤1/3 倉位 @ {px:.2f}",
+                    f"  止損      {px - 0.75*a:.2f}（-0.75×ATR 收緊）",
+                    f"  升級      評分升至 ≥5 補至全倉；退回 <3 分立即平倉",
+                ]
+    else:  # 穩健
+        if level == "red":
+            if direction == "bear":
+                L += [
+                    f"  空單進場  下一根 K 線收盤確認後 @ 市價",
+                    f"  止損      {px + 1.5*a:.2f}（+1.5×ATR 觸發時框）",
+                    f"  目標      {px - 2.0*a:.2f} / {px - 3.5*a:.2f}",
+                    f"  持多倉    減倉並收緊止損至 {px + 1.0*a:.2f}",
+                ]
+            else:
+                L += [
+                    f"  多單進場  下一根 K 線收盤確認後 @ 市價",
+                    f"  止損      {px - 1.5*a:.2f}（-1.5×ATR 觸發時框）",
+                    f"  目標      {px + 2.0*a:.2f} / {px + 3.5*a:.2f}",
+                ]
+        else:
+            L += ["  僅觀察，暫不建倉；等評分升級或翻轉確認"]
+
+    L.append("  ⚠️ 程式化參考，非投資建議")
+    return L
+
+
+def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_price, atr_1d, plan_style="穩健"):
+    atype     = resonance.get("atype","")
+    trig      = resonance.get("trigger") or {}
+    direction = resonance.get("direction")
+    level     = resonance.get("level")
+    pts       = resonance.get("pts", 0)
+
+    if resonance["alert"] and direction == "bear" and level == "red":
+        header = f"🔴 {symbol} 風險警報（空頭 {pts} 分）"
+    elif resonance["alert"] and direction == "bull" and level == "red":
+        header = f"⚡ {symbol} 進場預警（多頭 {pts} 分）"
+    elif resonance["alert"] and direction == "bear":
+        header = f"🟠 {symbol} 觀察訊號（空頭 {pts} 分）"
+    elif resonance["alert"]:
+        header = f"👀 {symbol} 觀察訊號（多頭 {pts} 分）"
     elif resonance["score"] >= resonance["max"] * 0.7:
         header = f"📈 {symbol} 多頭共振"
     else:
@@ -565,37 +919,86 @@ def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_pric
     for r in cascade:
         if not r.get("valid") or r["tf"] not in confirm_tfs:
             continue
-        icon = "✅" if r["hist"]>0 else "❌"
+        aligned = (r["hist"] < 0) if direction == "bear" else (r["hist"] > 0)
+        icon = "✅" if aligned else "❌"
         lines.append(f"  {r['tf']:>3s}  {icon}  Hist {fmt(r['hist'],3)}  D+1 {fmt(r['d1'],3)}")
 
     if trig and trig.get("valid"):
         h, d1 = trig["hist"], trig["d1"]
-        warn  = " ← 預計翻正 🚨" if h<0 and d1>0 else ""
+        hc    = trig.get("hist_c", h)
+        if   hc < 0 and d1 > 0: warn = " ← 預計翻正 🚨"
+        elif hc > 0 and d1 < 0: warn = " ← 預計翻負 ⚠️"
+        else:                   warn = ""
         lines += [
             f"\n【觸發時框 {trigger_tf}】",
-            f"  現在  Hist {fmt(h,3)}",
+            f"  已收盤 Hist {fmt(hc,3)}  ← 訊號判定用",
+            f"  形成中 Hist {fmt(h,3)}（未收盤，僅預覽）",
             f"  D+1        {fmt(d1,3)}{warn}",
             f"  D+2        {fmt(trig['d2'],3)}",
             f"  D+3        {fmt(trig['d3'],3)}",
         ]
+
+        # ── v2.2 量能確認 ──────────────────────────────────
+        vparts = []
+        rv = trig.get("rvol")
+        if rv is not None:
+            tag = "機構級 🔥" if rv >= 2.5 else ("放量" if rv >= 1.5 else ("縮量" if rv < 0.8 else "正常"))
+            vparts.append(f"RVOL  {rv:.2f}×（{tag}）")
+        vw = trig.get("vwap")
+        if vw:
+            pos  = "下方" if trig.get("below_vwap") else "上方"
+            dist = abs(trig["close"]/vw - 1) * 100
+            vparts.append(f"VWAP  {vw:.2f}（價格在{pos} {dist:.2f}%）")
+        gp = trig.get("gap_pct")
+        if gp is not None and abs(gp) >= 0.003:
+            vparts.append(f"缺口  {gp*100:+.2f}%")
+        if vparts:
+            lines += ["\n【量能確認】"] + [f"  {p}" for p in vparts]
+
+    # ── v2.2 警報評分明細 ─────────────────────────────────
+    if resonance.get("detail"):
+        badge = "🔴 警報" if level == "red" else "🟠 觀察"
+        lines += [f"\n【警報評分 {pts} 分｜{badge}】"]
+        lines += [f"  • {d}" for d in resonance["detail"]]
+
+    # ── v2.3 交易建議 ─────────────────────────────────────
+    if resonance["alert"]:
+        lines += build_trade_plan(direction, level, pts, trig, plan_style)
 
     lines += [f"\n【共振強度】 {resonance['score']}/{resonance['max']}"]
     if atype:
         lines.append(f"【信號類型】 {atype}")
 
     if atr_1d > 0:
-        stop = close_price - 1.5 * atr_1d
-        tg1  = close_price + 2.0 * atr_1d
-        tg2  = close_price + 3.5 * atr_1d
-        lines += [
-            f"\n【參考位置】 收盤 {close_price:.2f}",
-            f"  止損  {stop:.2f}  (-1.5×ATR)",
-            f"  目標1 {tg1:.2f}  (+2.0×ATR)",
-            f"  目標2 {tg2:.2f}  (+3.5×ATR)",
-            f"  ATR   {atr_1d:.3f}",
-        ]
+        if direction == "bear":
+            stop = close_price + 1.5 * atr_1d
+            tg1  = close_price - 2.0 * atr_1d
+            tg2  = close_price - 3.5 * atr_1d
+            lines += [
+                f"\n【參考位置｜空頭】 收盤 {close_price:.2f}",
+                f"  止損  {stop:.2f}  (+1.5×ATR)",
+                f"  目標1 {tg1:.2f}  (-2.0×ATR)",
+                f"  目標2 {tg2:.2f}  (-3.5×ATR)",
+                f"  ATR   {atr_1d:.3f}",
+            ]
+        else:
+            stop = close_price - 1.5 * atr_1d
+            tg1  = close_price + 2.0 * atr_1d
+            tg2  = close_price + 3.5 * atr_1d
+            lines += [
+                f"\n【參考位置】 收盤 {close_price:.2f}",
+                f"  止損  {stop:.2f}  (-1.5×ATR)",
+                f"  目標1 {tg1:.2f}  (+2.0×ATR)",
+                f"  目標2 {tg2:.2f}  (+3.5×ATR)",
+                f"  ATR   {atr_1d:.3f}",
+            ]
 
-    lines.append(f"\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')} ET")
+    # ── v2.2：真正的美東時間 + 休市標註 ────────────────────
+    ny = datetime.now(ZoneInfo("America/New_York"))
+    stale = (trig.get("last_bar_day") and ny.strftime("%Y-%m-%d") != trig["last_bar_day"])
+    if ny.weekday() >= 5 or stale:
+        lines.insert(2, "⏸ 非交易時段／休市，以下為最近收盤數據")
+    lines.append(f"\n📅 {ny.strftime('%Y-%m-%d %H:%M')} ET")
     return "\n".join(lines)
 
 def send_telegram(token, chat_id, text):
@@ -1160,6 +1563,14 @@ with st.sidebar:
         trigger_tf  = chain_tfs[0] if chain_tfs else "30m"
         confirm_tfs = []
 
+    st.markdown("**🎯 交易建議風格**")
+    plan_style = st.radio(
+        "風格", ["穩健", "激進"], horizontal=True, index=0,
+        label_visibility="collapsed",
+        help="穩健：等下一根收盤確認、1.5×ATR 止損｜"
+             "激進：訊號 bar 即進場、1.0×ATR 緊止損、允許加倉、含持倉處置",
+    )
+
     st.markdown("---")
     st.markdown("**⏱ 自動刷新**")
     auto_refresh     = st.checkbox("啟用", value=False)
@@ -1171,6 +1582,9 @@ with st.sidebar:
     st.markdown("**📡 Telegram**")
     tg_token = st.text_input("Bot Token", type="password", placeholder="xxxxx:ABC...")
     tg_chat  = st.text_input("Chat ID",  placeholder="-100xxxxxxxxx")
+    tg_auto  = st.checkbox("🔔 警報自動推送", value=False,
+                            help="偵測到預警/警報時自動推送 Telegram（同一訊號每小時最多一次），"
+                                 "需配合「自動刷新」使用")
     tg_send  = st.button("📤 發送所有信號")
 
     st.markdown("---")
@@ -1224,6 +1638,7 @@ st.markdown("---")
 
 tf_cfg      = TIMEFRAME_MAP[main_tf]
 tg_msgs_all = []
+rank_data   = []
 
 for symbol in symbols:
     st.markdown(f"## 🔷 {symbol}")
@@ -1296,31 +1711,60 @@ for symbol in symbols:
                 f"<div style='text-align:right;margin-top:10px'>{stars_html(resonance['score'],resonance['max'])}</div>",
                 unsafe_allow_html=True)
 
-        # ── 預警橫幅 ────────────────────────────────────────
+        # ── 預警橫幅（v2.2 計分制：紅色警報卡 / 橙色觀察條）──
         if resonance["alert"]:
-            trig_d = resonance.get("trigger") or {}
-            atype  = resonance.get("atype","")
-            if "預警" in atype:
-                h_now = trig_d.get("hist",0)
-                d1_v  = trig_d.get("d1",0)
+            trig_d  = resonance.get("trigger") or {}
+            atype   = resonance.get("atype","")
+            lvl     = resonance.get("level")
+            pts_v   = resonance.get("pts",0)
+            det_ls  = resonance.get("detail",[])
+            det_html = "".join(f"&nbsp;&nbsp;• {d}<br>" for d in det_ls)
+            plan_ls  = build_trade_plan(resonance.get("direction"), lvl, pts_v,
+                                        trig_d, plan_style)
+            plan_html = "".join(
+                f"&nbsp;&nbsp;{p.strip()}<br>" for p in plan_ls
+                if not p.startswith("\n【"))
+            hc_v  = trig_d.get("hist_c",0)
+            hcp_v = trig_d.get("hist_c_prev",0)
+            d1_v  = trig_d.get("d1",0)
+            rv_v  = trig_d.get("rvol")
+            rv_txt = f"｜RVOL {rv_v:.2f}×" if rv_v is not None else ""
+
+            if resonance.get("direction") == "bear" and lvl == "red":
+                st.markdown(f"""<div class="alert-card-bear">
+                    <div style="font-family:'IBM Plex Mono',monospace;font-size:15px;
+                                font-weight:700;margin-bottom:10px;color:#9b2335;">
+                        🔴 風險警報 {pts_v} 分｜{symbol} [{trigger_tf}]{rv_txt}
+                    </div>
+                    <div class="alert-body">
+                    {atype}<br>
+                    {trigger_tf} Histogram（已收盤）前根 <b>{hcp_v:+.3f}</b> → 現在
+                    <b style="color:#c0392b">{hc_v:+.3f}</b>｜D+1 預測
+                    <b style="color:#c0392b">{d1_v:+.3f}</b><br>
+                    <br><b>評分明細：</b><br>{det_html}
+                    <br><b>交易建議（{plan_style}）：</b><br>{plan_html}
+                    </div>
+                </div>""", unsafe_allow_html=True)
+            elif resonance.get("direction") == "bull" and lvl == "red":
                 st.markdown(f"""<div class="alert-card">
                     <div style="font-family:'IBM Plex Mono',monospace;font-size:15px;
                                 font-weight:700;margin-bottom:10px;">
-                        ⚡ 進場預警｜{symbol} [{trigger_tf}]
+                        ⚡ 進場預警 {pts_v} 分｜{symbol} [{trigger_tf}]{rv_txt}
                     </div>
                     <div class="alert-body">
-                    確認時框（{confirm_str}）✅ 多頭方向對齊<br>
-                    {trigger_tf} Histogram 現在 <b style="color:#c0392b">{h_now:+.3f}</b>（仍為負）<br>
-                    {trigger_tf} D+1 預測 <b style="color:#3d8b5e">{d1_v:+.3f}</b>
-                    &nbsp;→&nbsp; <b>預計下一根 K 線翻正</b><br>
-                    <br>
-                    📌 建議：提前掛單準備做多，下一根 {trigger_tf} K線收盤確認後執行<br>
-                    🛑 止損：收盤 {close_val:.2f} &minus; 1.5 × ATR({main_tf}) =
-                       <b>{close_val - 1.5*atr_main:.2f}</b>
+                    {atype}<br>
+                    {trigger_tf} Histogram（已收盤）現在 <b>{hc_v:+.3f}</b>｜D+1 預測
+                    <b style="color:#3d8b5e">{d1_v:+.3f}</b><br>
+                    <br><b>評分明細：</b><br>{det_html}
+                    <br><b>交易建議（{plan_style}）：</b><br>{plan_html}
                     </div>
                 </div>""", unsafe_allow_html=True)
+            elif resonance.get("direction") == "bear":
+                plan_txt = "  \n".join(p.strip() for p in plan_ls if not p.startswith("\n【"))
+                st.warning(f"🟠 {atype}｜" + "、".join(det_ls) + "  \n" + plan_txt)
             else:
-                st.info(f"👀 {atype}｜{trigger_tf} 空頭動能縮減，持續觀察傳導鏈")
+                plan_txt = "  \n".join(p.strip() for p in plan_ls if not p.startswith("\n【"))
+                st.info(f"👀 {atype}｜" + "、".join(det_ls) + "  \n" + plan_txt)
 
         # ── 傳導鏈總覽圖 ────────────────────────────────────
         st.plotly_chart(build_cascade_chart(cascade), use_container_width=True, key=f"cascade_{symbol}_{id(cascade)}")
@@ -1395,14 +1839,76 @@ for symbol in symbols:
         st.plotly_chart(fig, use_container_width=True, key=f"macd_chart_{symbol}")
 
     # ── Telegram 信號 ─────────────────────────────────────────
-    tg_msg = build_tg_msg(symbol, cascade, resonance,
-                           confirm_tfs, trigger_tf, close_val, atr_main)
-    tg_msgs_all.append(tg_msg)
-    with st.expander(f"📡 Telegram 信號 — {symbol}"):
-        st.markdown(f'<div class="tg-box">{tg_msg}</div>', unsafe_allow_html=True)
+    if chain_tfs:
+        tg_msg = build_tg_msg(symbol, cascade, resonance,
+                               confirm_tfs, trigger_tf, close_val, atr_main,
+                               plan_style=plan_style)
+        tg_msgs_all.append(tg_msg)
+
+        # ── v2.4：蒐集排序比較數據（供排行榜與深度分析 Prompt 使用）──
+        trig_d = resonance.get("trigger") or {}
+        rank_data.append({
+            "symbol": symbol, "close": close_val, "atr": atr_main,
+            "atr_pct": (atr_main/close_val*100) if close_val else 0,
+            "trend": trend,
+            "alert": resonance["alert"], "direction": resonance.get("direction"),
+            "level": resonance.get("level"), "pts": resonance.get("pts", 0),
+            "atype": resonance.get("atype"),
+            "score": resonance["score"], "max": resonance["max"],
+            "detail": resonance.get("detail", []),
+            "rvol": trig_d.get("rvol"), "below_vwap": trig_d.get("below_vwap"),
+            "vwap": trig_d.get("vwap"), "gap_pct": trig_d.get("gap_pct"),
+            "trigger_tf": trigger_tf,
+            "cascade": [
+                {"tf": r["tf"], "hist": r.get("hist_c", r.get("hist")), "d1": r.get("d1")}
+                for r in cascade if r.get("valid")
+            ],
+        })
+    else:
+        tg_msg = ""
+
+    # ── 警報自動推送（去重：symbol+方向+等級 每小時最多一次）──
+    if chain_tfs and tg_auto and resonance["alert"] and tg_token and tg_chat:
+        _dk = hashlib.md5(
+            f"{symbol}|{resonance.get('direction')}|{resonance.get('level')}|{trigger_tf}|"
+            f"{datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H')}".encode()
+        ).hexdigest()
+        _sent = st.session_state.setdefault("tg_sent_hashes", set())
+        if _dk not in _sent:
+            ok_auto, _ = send_telegram(tg_token, tg_chat, tg_msg)
+            if ok_auto:
+                _sent.add(_dk)
+                st.toast(f"🔔 已自動推送 {symbol} 警報", icon="📡")
+    if chain_tfs:
+        with st.expander(f"📡 Telegram 信號 — {symbol}"):
+            st.markdown(f'<div class="tg-box">{tg_msg}</div>', unsafe_allow_html=True)
 
     st.markdown("---")
 
+
+# ── v2.4 排序比較 + 深度分析 Prompt ─────────────────────────────
+if rank_data:
+    st.markdown("## 🏆 排序比較")
+    ranked = sorted(rank_data, key=rank_key, reverse=True)
+    disp_rows = []
+    for i, r in enumerate(ranked, 1):
+        dirn = {"bear":"🔴 空頭","bull":"🟢 多頭",None:"—"}.get(r["direction"],"—")
+        lvl  = {"red":"🔴 紅色警報","yellow":"🟠 橙色觀察",None:"⚪ 靜默"}.get(r["level"],"⚪ 靜默")
+        disp_rows.append({
+            "排名": i, "代碼": r["symbol"], "方向": dirn, "等級": lvl,
+            "評分": r["pts"], "收盤": round(r["close"],2),
+            "ATR%": round(r["atr_pct"],2), "趨勢": r["trend"],
+            "RVOL": f"{r['rvol']:.2f}×" if r.get("rvol") is not None else "—",
+        })
+    st.dataframe(pd.DataFrame(disp_rows), hide_index=True, use_container_width=True)
+
+    st.markdown("#### 📋 最佳股票分析 Prompt · 複製後貼入任意 AI 進行深度分析")
+    st.caption("本系統只做技術面 + 量能的程式化判定；把下方內容貼給 ChatGPT / Claude / "
+               "Gemini 等，可補上基本面、新聞、產業比較等本系統覆蓋不到的部分。")
+    prompt_text = build_analysis_prompt(rank_data, main_tf, trigger_tf)
+    st.code(prompt_text, language="markdown")
+
+st.markdown("---")
 
 # ── 批量發送 Telegram ─────────────────────────────────────────
 if tg_send:
