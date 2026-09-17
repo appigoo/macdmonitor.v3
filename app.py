@@ -265,6 +265,18 @@ def calc_vwap(df):
     cum_v  = df["Volume"].groupby(day).cumsum()
     return cum_pv / cum_v.replace(0, np.nan)
 
+def calc_rolling_vwap(df, n=20):
+    """
+    滾動 VWAP（日線／週線用）。
+    日線一根 K = 一天，用「當日錨定」會退化成該根自己的典型價
+    （價格跟自己比恆等於零，毫無資訊量），故改用 n 根滾動的
+    成交量加權均價，作為中期持倉成本錨。
+    """
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    pv = (tp * df["Volume"]).rolling(n, min_periods=max(3, n//4)).sum()
+    v  = df["Volume"].rolling(n, min_periods=max(3, n//4)).sum()
+    return pv / v.replace(0, np.nan)
+
 def predict_next3(hist):
     """
     D+1: 線性外推（延續當前動能斜率）
@@ -418,15 +430,16 @@ def analyze_cascade(symbol, chain):
         rv_series = calc_rvol(df) if intraday else calc_rvol_simple(df)
         rvol = rv_series.iloc[-2] if len(rv_series) > 1 else np.nan
 
-        # ── VWAP（僅日內，已收盤 bar 位置）──
+        # ── VWAP（已收盤 bar 位置）──
+        #    日內：當日錨定 VWAP｜日/週線：20 根滾動 VWAP
         vwap_val, below_vwap = None, None
-        if intraday:
-            vw = calc_vwap(df)
-            if len(vw) > 1 and pd.notna(vw.iloc[-2]):
-                vwap_val   = float(vw.iloc[-2])
-                below_vwap = bool(df["Close"].iloc[-2] < vwap_val)
+        vwap_kind = "當日VWAP" if intraday else "20期滾動VWAP"
+        vw = calc_vwap(df) if intraday else calc_rolling_vwap(df)
+        if len(vw) > 1 and pd.notna(vw.iloc[-2]):
+            vwap_val   = float(vw.iloc[-2])
+            below_vwap = bool(df["Close"].iloc[-2] < vwap_val)
 
-        # ── 開盤缺口（僅日內且數據含前一交易日）──
+        # ── 缺口（日內：當日開盤跳空｜日/週線：該根開盤 vs 前一根收盤）──
         gap_pct = None
         if intraday:
             days = df.index.normalize()
@@ -434,6 +447,10 @@ def analyze_cascade(symbol, chain):
             if len(uday) >= 2:
                 prev_close = df["Close"][days == uday[-2]].iloc[-1]
                 gap_pct    = float(df["Open"][days == uday[-1]].iloc[0] / prev_close - 1)
+        elif len(df) >= 3:
+            prev_close = df["Close"].iloc[-3]
+            if prev_close:
+                gap_pct = float(df["Open"].iloc[-2] / prev_close - 1)
 
         bar_dn = bool(df["Close"].iloc[-2] < df["Open"].iloc[-2]) if len(df) > 1 else False
 
@@ -445,7 +462,7 @@ def analyze_cascade(symbol, chain):
             "d1":d1, "d2":d2, "d3":d3,
             "sigma":sigma, "accel_dn":accel_dn, "accel_up":accel_up,
             "rvol": float(rvol) if pd.notna(rvol) else None,
-            "vwap":vwap_val, "below_vwap":below_vwap,
+            "vwap":vwap_val, "below_vwap":below_vwap, "vwap_kind":vwap_kind,
             "gap_pct":gap_pct, "bar_dn":bar_dn,
             "last_bar_day": str(df.index[-1].date()),
             "trend":get_trend(mv,hv,sv),
@@ -800,6 +817,9 @@ def build_analysis_prompt(rank_data, main_tf, trigger_tf):
     L.append("")
     L.append("以下是我用自建的 MACD 瀑布傳導 + RVOL/VWAP 量能計分系統，")
     L.append(f"對多支股票在 {main_tf} 主時框、{trigger_tf} 觸發時框下跑出的技術面排行結果。")
+    _vk = next((r.get("vwap_kind") for r in rank_data if r.get("vwap_kind")), None)
+    if _vk:
+        L.append(f"（VWAP 定義：{_vk}；日內為當日錨定，日/週線為 20 期滾動成交量加權均價）")
     L.append("請你在此技術面基礎上，補充做以下深度分析：")
     L.append("1. 逐一檢查近期基本面／財報／新聞事件，是否與技術面訊號吻合或衝突")
     L.append("2. 若有多支同向訊號，比較哪一支的風險報酬比最佳，並說明原因")
@@ -825,7 +845,11 @@ def build_analysis_prompt(rank_data, main_tf, trigger_tf):
         lvl   = {"red":"紅色警報","yellow":"橙色觀察",None:"靜默"}.get(r["level"],"靜默")
         score_disp = r["pts"] if r["pts"] else f"潛在{sub}"
         rvol  = f"{r['rvol']:.2f}×" if r.get("rvol") is not None else "—"
-        vwapp = ("下方" if r.get("below_vwap") else "上方") if r.get("below_vwap") is not None else "—"
+        if r.get("vwap") and r.get("below_vwap") is not None:
+            vwapp = (f"{'下方' if r['below_vwap'] else '上方'} "
+                     f"{abs(r['close']/r['vwap']-1)*100:.2f}%（{r['vwap']:.2f}）")
+        else:
+            vwapp = "—"
         L.append(f"| {i} | {r['symbol']} | {dirn} | {lvl} | {score_disp} | "
                   f"{r['close']:.2f} | {r['atr_pct']:.2f}% | {r['trend']} | {rvol} | {vwapp} |")
 
@@ -977,7 +1001,8 @@ def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_pric
         if vw:
             pos  = "下方" if trig.get("below_vwap") else "上方"
             dist = abs(trig["close"]/vw - 1) * 100
-            vparts.append(f"VWAP  {vw:.2f}（價格在{pos} {dist:.2f}%）")
+            kind = trig.get("vwap_kind", "VWAP")
+            vparts.append(f"{kind}  {vw:.2f}（價格在{pos} {dist:.2f}%）")
         gp = trig.get("gap_pct")
         if gp is not None and abs(gp) >= 0.003:
             vparts.append(f"缺口  {gp*100:+.2f}%")
@@ -1887,7 +1912,8 @@ for symbol in symbols:
             "score": resonance["score"], "max": resonance["max"],
             "detail": resonance.get("detail", []),
             "rvol": trig_d.get("rvol"), "below_vwap": trig_d.get("below_vwap"),
-            "vwap": trig_d.get("vwap"), "gap_pct": trig_d.get("gap_pct"),
+            "vwap": trig_d.get("vwap"), "vwap_kind": trig_d.get("vwap_kind"),
+            "gap_pct": trig_d.get("gap_pct"),
             "trigger_tf": trigger_tf,
             "cascade": [
                 {"tf": r["tf"], "hist": r.get("hist_c", r.get("hist")), "d1": r.get("d1")}
@@ -1938,6 +1964,11 @@ if rank_data:
             "收盤": f"{r['close']:.2f}",
             "ATR%": f"{r['atr_pct']:.2f}%", "趨勢": r["trend"],
             "RVOL": f"{r['rvol']:.2f}×" if r.get("rvol") is not None else "—",
+            "VWAP位置": (
+                f"{'下方' if r['below_vwap'] else '上方'} "
+                f"{abs(r['close']/r['vwap']-1)*100:.2f}%"
+                if r.get("vwap") and r.get("below_vwap") is not None else "—"
+            ),
         })
     st.dataframe(pd.DataFrame(disp_rows), hide_index=True, use_container_width=True)
     if all(r["pts"] == 0 for r in rank_data):
