@@ -49,7 +49,7 @@ import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
+from datetime import datetime, time as dtime
 import requests
 import time
 import hashlib
@@ -203,6 +203,34 @@ TIMEFRAME_MAP = {
 }
 
 DEFAULT_SYMBOLS = ["TSLA","AAPL","AMZN","NVDA","MSFT"]
+
+# ── v2.7：大時框「形成中 bar」偵測 ──────────────────────────────
+# 日內時框（1m–1h）在 analyze_cascade() 已用 hist_c/hist_c_prev（永遠丟最後一根未收盤
+# bar）處理過；但主時框頂部卡片（收盤/Hist/趨勢…）與 build_macd_table 一直是用
+# df 最後一列，日/週/月線在「當天/當週/當月尚未收盤」時會把 yfinance 回傳的
+# 即時/預覽價格當成「收盤」顯示 —— 這正是 AAPL 卡片數字與實際昨收不符的原因。
+def is_bar_forming(bar_ts, interval):
+    """判斷 df 最後一根 K 線是否仍在形成中（尚未真正收盤）。僅處理 1d/1wk/1mo；
+    分鐘級時框由 analyze_cascade 的已收盤邏輯另外處理，這裡一律回傳 False。"""
+    try:
+        ny = datetime.now(ZoneInfo("America/New_York"))
+        bts = bar_ts.tz_convert("America/New_York") if bar_ts.tzinfo else bar_ts
+    except Exception:
+        return False
+    if interval == "1d":
+        return bts.date() == ny.date() and ny.time() < dtime(16, 0)
+    if interval == "1wk":
+        bw = bts.isocalendar()[:2]; nw = ny.isocalendar()[:2]
+        return bw == nw and not (ny.weekday() == 4 and ny.time() >= dtime(16, 0))
+    if interval == "1mo":
+        return (bts.year, bts.month) == (ny.year, ny.month)
+    return False
+
+def drop_forming_bar(df, interval):
+    """若最後一根尚未收盤，丟棄它，改用「上一根已收盤」的數據做顯示與計算。"""
+    if len(df) > 1 and is_bar_forming(df.index[-1], interval):
+        return df.iloc[:-1]
+    return df
 
 STATUS_NEXT_DAY = {
     "空頭動能強":    ("跌勢延續",    "bear"),
@@ -401,6 +429,7 @@ def analyze_cascade(symbol, chain):
         if not cfg:
             continue
         df = fetch_data(symbol, cfg["period"], cfg["interval"])
+        df = drop_forming_bar(df, cfg["interval"])
         if df.empty or len(df) < 30:
             results.append({"tf":tf, "valid":False})
             continue
@@ -1699,6 +1728,7 @@ for symbol in symbols:
 
     with st.spinner(f"載入 {symbol}..."):
         df_main = fetch_data(symbol, tf_cfg["period"], tf_cfg["interval"])
+        df_main = drop_forming_bar(df_main, tf_cfg["interval"])
 
     if df_main.empty or len(df_main) < 30:
         st.warning(f"⚠️ {symbol} 數據不足，跳過")
