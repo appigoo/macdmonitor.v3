@@ -415,6 +415,7 @@ def fetch_data(symbol, period, interval):
             df = pd.DataFrame()
         st.session_state[cache_key] = df
         st.session_state[ts_key]    = now
+        st.session_state["_last_any_fetch_ts"] = now
 
     return st.session_state[cache_key]
 
@@ -1656,7 +1657,9 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("**⏱ 自動刷新**")
-    auto_refresh     = st.checkbox("啟用", value=False)
+    auto_refresh     = st.checkbox("啟用", value=True, key="auto_refresh_enabled",
+                                    help="Streamlit 只有在互動或此開關開啟時才會重新執行整頁；"
+                                         "關閉此開關且分頁長時間沒有點擊，畫面會停在上次載入時的舊資料。")
     refresh_interval = st.selectbox("間隔（秒）", [60,120,180,300], index=0)
     # 存入 session_state 供 fetch_data 動態快取使用
     st.session_state["refresh_interval"] = refresh_interval
@@ -1704,6 +1707,22 @@ if auto_refresh:
 # ══════════════════════════════════════════════════════════════
 st.markdown("# 🌊 MACD 瀑布動能傳導系統")
 import time as _time_main
+
+# ── v2.8：資料過期警示 ──────────────────────────────────────────
+# Streamlit 只在使用者互動或 st_autorefresh 觸發時才會重新執行整頁；
+# 若「自動刷新」關閉且分頁長時間沒有互動，fetch_data() 的 TTL 檢查
+# 根本沒機會被執行，畫面會停在「上次腳本真的跑過」那一刻的舊快照
+# （例如週一開著分頁沒動，週三看到的還是週一的收盤）。
+_last_fetch_ts = st.session_state.get("_last_any_fetch_ts")
+if _last_fetch_ts:
+    _stale_h = (_time_main.time() - _last_fetch_ts) / 3600
+    if (not auto_refresh) and _stale_h >= 2:
+        st.warning(
+            f"⚠️ 偵測到此分頁已約 {_stale_h:.1f} 小時沒有重新整理過(「自動刷新」目前關閉,"
+            f"Streamlit 只在互動或自動刷新觸發時才會重跑)。以下可能是舊快照,"
+            f"建議開啟自動刷新,或點側邊欄「🔄 立即清除快取」。"
+        )
+
 _ttl_now = st.session_state.get("refresh_interval", 60)
 _slot_ts = (int(_time_main.time()) // _ttl_now) * _ttl_now
 _data_ts = datetime.fromtimestamp(_slot_ts).strftime("%H:%M:%S")
